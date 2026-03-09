@@ -1,0 +1,3 @@
+[submodule "tanstack-db"]
+	path = tanstack-db
+	url = https://github.com/TanStack/db.git

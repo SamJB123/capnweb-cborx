@@ -99,6 +99,7 @@ export class MapBuilder implements Exporter {
   capture(hook: StubHook): number {
     if (hook instanceof MapVariableHook && hook.mapper === this) {
       // Oh, this is already our own hook.
+      console.log(`[MAP CAPTURE] Own MapVariableHook idx=${hook.idx}`);
       return hook.idx;
     }
 
@@ -110,12 +111,15 @@ export class MapBuilder implements Exporter {
       if (this.context.parent) {
         let parentIdx = this.context.parent.capture(hook);
         this.context.captures.push(parentIdx);
+        console.log(`[MAP CAPTURE] Via parent, parentIdx=${parentIdx}, captures now:`, this.context.captures);
       } else {
         this.context.captures.push(hook);
+        console.log(`[MAP CAPTURE] Root capture, hook type=${hook.constructor.name}, captures.length=${this.context.captures.length}`);
       }
       result = -this.context.captures.length;
       this.captureMap.set(hook, result);
     }
+    console.log(`[MAP CAPTURE] Returning result=${result}`);
     return result;
   }
 
@@ -260,24 +264,32 @@ export function __experimental_recordInputPath(path: PropertyPath): RecordedMapP
 
 class MapApplicator implements Importer {
   private variables: StubHook[];
+  private static instanceCount = 0;
+  private instanceId: number;
 
   constructor(private captures: StubHook[], input: StubHook) {
     this.variables = [input];
+    this.instanceId = ++MapApplicator.instanceCount;
+    console.log(`[MAP APPLY] MapApplicator#${this.instanceId} created, captures.length=${captures.length}, input=${input.constructor.name}`);
   }
 
   dispose() {
+    console.log(`[MAP APPLY] MapApplicator#${this.instanceId} dispose() called, variables.length=${this.variables.length}`);
     for (let variable of this.variables) {
+      console.log(`[MAP APPLY] MapApplicator#${this.instanceId} disposing variable: ${variable.constructor.name}`);
       variable.dispose();
     }
   }
 
   apply(instructions: unknown[]): RpcPayload {
+    console.log(`[MAP APPLY] MapApplicator#${this.instanceId} apply() called, instructions.length=${instructions.length}`);
     try {
       if (instructions.length < 1) {
         throw new Error("Invalid empty mapper function.");
       }
 
       for (let instruction of instructions.slice(0, -1)) {
+        console.log(`[MAP APPLY] MapApplicator#${this.instanceId} evaluating instruction:`, JSON.stringify(instruction).substring(0, 100));
         let payload = new Evaluator(this).evaluateCopy(instruction);
 
         // The payload almost always contains a single stub. As an optimization, unwrap it.
@@ -285,18 +297,22 @@ class MapApplicator implements Importer {
           let hook = unwrapStubNoProperties(payload.value);
           if (hook) {
             this.variables.push(hook);
+            console.log(`[MAP APPLY] MapApplicator#${this.instanceId} added unwrapped hook to variables, now ${this.variables.length}`);
             continue;
           }
         }
 
         this.variables.push(new PayloadStubHook(payload));
+        console.log(`[MAP APPLY] MapApplicator#${this.instanceId} added PayloadStubHook to variables, now ${this.variables.length}`);
       }
 
+      console.log(`[MAP APPLY] MapApplicator#${this.instanceId} evaluating final instruction`);
       return new Evaluator(this).evaluateCopy(instructions[instructions.length - 1]);
     } finally {
-      for (let variable of this.variables) {
-        variable.dispose();
-      }
+      // Note: Variables are disposed by the caller via mapper.dispose(), not here.
+      // Disposing here would cause double-disposal which breaks PromiseStubHook's
+      // deferred disposal scheduling.
+      console.log(`[MAP APPLY] MapApplicator#${this.instanceId} apply() completed`);
     }
   }
 
@@ -310,11 +326,15 @@ class MapApplicator implements Importer {
   }
 
   getExport(idx: ExportId): StubHook | undefined {
+    let result: StubHook | undefined;
     if (idx < 0) {
-      return this.captures[-idx - 1];
+      result = this.captures[-idx - 1];
+      console.log(`[MAP APPLY] MapApplicator#${this.instanceId} getExport(${idx}) -> captures[${-idx - 1}] = ${result?.constructor.name}`);
     } else {
-      return this.variables[idx];
+      result = this.variables[idx];
+      console.log(`[MAP APPLY] MapApplicator#${this.instanceId} getExport(${idx}) -> variables[${idx}] = ${result?.constructor.name}`);
     }
+    return result;
   }
 
   getPipeReadable(exportId: ExportId): never {
@@ -327,11 +347,13 @@ function applyMapToElement(input: unknown, parent: object | undefined, owner: Rp
   // TODO(perf): I wonder if we could use .fromAppParams() instead of .deepCopyFrom()? It
   //   maybe wouldn't correctly handle the case of RpcTargets in the input, so we need a variant
   //   which takes an `owner`, which does add some complexity.
+  console.log(`[MAP ELEMENT] applyMapToElement called, input type=${typeof input}, captures.length=${captures.length}`);
   let inputHook = new PayloadStubHook(RpcPayload.deepCopyFrom(input, parent, owner));
   let mapper = new MapApplicator(captures, inputHook);
   try {
     return mapper.apply(instructions);
   } finally {
+    console.log(`[MAP ELEMENT] applyMapToElement finally block, calling mapper.dispose()`);
     mapper.dispose();
   }
 }

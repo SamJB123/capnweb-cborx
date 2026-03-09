@@ -298,4 +298,30 @@ describe("workerd RPC server", () => {
     expect(await Promise.all([promise1, promise2, promise3]))
         .toStrictEqual([36, 5, 9]);
   })
+
+  it("can restore a hibernatable websocket server and reacquire a durable capability from a new session", async () => {
+    let resp = await (<Env>env).testServer.fetch("http://foo/hibernate", {headers: {Upgrade: "websocket"}});
+    let ws = resp.webSocket;
+    expect(ws).toBeTruthy();
+
+    ws!.accept();
+    let cap = newWebSocketRpcSession<any>(ws!);
+
+    let counter = await cap.getDurableCounter("alpha");
+    expect(await counter.increment(2)).toBe(2);
+
+    let restoreResp = await (<Env>env).testServer.fetch("http://foo/hibernate-force", { method: "POST" });
+    expect(restoreResp.status).toBe(200);
+
+    let resp2 = await (<Env>env).testServer.fetch("http://foo/hibernate", {headers: {Upgrade: "websocket"}});
+    let ws2 = resp2.webSocket;
+    expect(ws2).toBeTruthy();
+
+    ws2!.accept();
+    let cap2 = newWebSocketRpcSession<any>(ws2!);
+
+    let reacquired = await cap2.getDurableCounter("alpha");
+    expect(await reacquired.value).toBe(2);
+    expect(await reacquired.increment(5)).toBe(7);
+  })
 });

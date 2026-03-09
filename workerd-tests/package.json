@@ -1,0 +1,14 @@
+{
+  "name": "capnweb-workerd-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.12.20",
+    "@cloudflare/workers-types": "^4.20260101.0",
+    "typescript": "^5.9.3",
+    "vitest": "3.2.4"
+  }
+}

@@ -2,7 +2,13 @@
   "permissions": {
     "allow": [
       "Bash(node -e:*)",
-      "Bash(npx vitest:*)"
+      "Bash(npx vitest:*)",
+      "Bash(xargs ls:*)",
+      "Bash(grep:*)",
+      "WebSearch",
+      "Bash(dir \"C:\\\\Users\\\\sambi\\\\Github\\\\reference-material\\\\tanstack-db\")",
+      "Bash(dir \"C:\\\\Users\\\\sambi\\\\Github\\\\reference-material\\\\tanstack-db\\\\packages\")",
+      "Bash(dir:*)"
     ]
   }
 }

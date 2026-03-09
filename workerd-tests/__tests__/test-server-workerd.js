@@ -2,14 +2,6 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-// Test server implemented in workerd instead of Node.
-//
-// This is only used by the workerd tests, across a service binding.
-//
-// This file is JavaScript instead of TypeScript because otherwise we'd need to set up a separate
-// build step for it. Instead, we're getting by configuring the worker in vitest.config.ts by
-// just specifying the raw JS modules.
-
 import {
   __experimental_newDurableObjectSessionStore,
   __experimental_newHibernatableWebSocketRpcSession,
@@ -18,8 +10,6 @@ import {
 } from "../dist/index-workers.js";
 import { RpcTarget, DurableObject } from "cloudflare:workers";
 
-// TODO(cleanup): At present we clone the implementation of Counter and TestTarget because
-//   otherwise we need to set up a build step for `test-util.ts`.
 export class Counter extends RpcTarget {
   constructor(i) {
     super();
@@ -49,14 +39,36 @@ export class TestDo extends DurableObject {
   getValue() {
     return this.value;
   }
+}
 
-  subscribe(callback) {
-    this.subscriber = callback.dup();
+export class TestTarget extends RpcTarget {
+  constructor(env) {
+    super();
+    this.env = env;
   }
 
-  async notify(value) {
-    await this.subscriber(value);
-    this.subscriber[Symbol.dispose]();
+  square(i) {
+    return i * i;
+  }
+
+  callSquare(self, i) {
+    return { result: self.square(i) };
+  }
+
+  throwError() {
+    throw new RangeError("test error");
+  }
+
+  makeCounter(i) {
+    return new Counter(i);
+  }
+
+  incrementCounter(c, i = 1) {
+    return c.increment(i);
+  }
+
+  getDurableObject(name) {
+    return this.env.TEST_DO.getByName(name);
   }
 }
 
@@ -199,37 +211,6 @@ export class HibernationRpcDo extends DurableObject {
 
   getSessionId(ws) {
     return ws.deserializeAttachment()?.sessionId;
-  }
-}
-
-export class TestTarget extends RpcTarget {
-  constructor(env) {
-    super();
-    this.env = env;
-  }
-
-  square(i) {
-    return i * i;
-  }
-
-  callSquare(self, i) {
-    return { result: self.square(i) };
-  }
-
-  throwError() {
-    throw new RangeError("test error");
-  }
-
-  makeCounter(i) {
-    return new Counter(i);
-  }
-
-  incrementCounter(c, i = 1) {
-    return c.increment(i);
-  }
-
-  getDurableObject(name) {
-    return this.env.TEST_DO.getByName(name);
   }
 }
 

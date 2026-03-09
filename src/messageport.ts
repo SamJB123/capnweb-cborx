@@ -66,8 +66,13 @@ class MessagePortTransport implements RpcTransport {
     if (this.#error) {
       throw this.#error;
     }
-    // Transfer the buffer for zero-copy send
-    this.#port.postMessage(message, [message.buffer]);
+    try {
+      // Transfer the buffer for zero-copy send when supported.
+      this.#port.postMessage(message, [message.buffer]);
+    } catch (err) {
+      // workerd's MessagePort currently rejects transfer lists, so fall back to a copy.
+      this.#port.postMessage(message);
+    }
   }
 
   async receive(): Promise<Uint8Array> {

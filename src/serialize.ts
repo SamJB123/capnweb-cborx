@@ -306,7 +306,10 @@ export class Devaluator {
           e = rewritten;
         }
 
-        let result = ["error", e.name, e.message];
+        // Defensive: ensure e has name and message properties
+        const errorName = e?.name ?? 'Error';
+        const errorMessage = e?.message ?? String(e);
+        let result = ["error", errorName, errorMessage];
         if (rewritten && rewritten.stack) {
           result.push(rewritten.stack);
         }
@@ -722,6 +725,7 @@ export class Evaluator {
           if (!hook) {
             throw new Error(`no such entry on exports table: ${value[1]}`);
           }
+          console.log(`[REMAP] subject idx=${value[1]}, hook=${hook.constructor.name}, hookId=${'hookId' in hook ? (hook as any).hookId : 'N/A'}`); // DEBUG: REMOVE AFTER DEBUGGING
 
           let path = value[2];
           if (!path.every(
@@ -729,7 +733,7 @@ export class Evaluator {
             break;  // report error below
           }
 
-          let captures: StubHook[] = value[3].map(cap => {
+          let captures: StubHook[] = value[3].map((cap, i) => { // DEBUG: REMOVE AFTER DEBUGGING (was: cap => {)
             if (!(cap instanceof Array) ||
                 cap.length !== 2 ||
                 (cap[0] !== "import" && cap[0] !== "export") ||
@@ -738,19 +742,24 @@ export class Evaluator {
             }
 
             if (cap[0] === "export") {
-              return this.importer.importStub(cap[1]);
+              const result = this.importer.importStub(cap[1]); // DEBUG: REMOVE AFTER DEBUGGING (was: return this.importer...)
+              console.log(`[REMAP] capture[${i}] export idx=${cap[1]} -> ${result.constructor.name}, hookId=${'hookId' in result ? (result as any).hookId : 'N/A'}`); // DEBUG: REMOVE AFTER DEBUGGING
+              return result; // DEBUG: REMOVE AFTER DEBUGGING
             } else {
               let exp = this.importer.getExport(cap[1]);
               if (!exp) {
                 throw new Error(`no such entry on exports table: ${cap[1]}`);
               }
+              console.log(`[REMAP] capture[${i}] import idx=${cap[1]} -> ${exp.constructor.name}, hookId=${'hookId' in exp ? (exp as any).hookId : 'N/A'}, calling dup()`); // DEBUG: REMOVE AFTER DEBUGGING
               return exp.dup();
             }
           });
 
           let instructions = value[4];
+          console.log(`[REMAP] calling hook.map() with ${captures.length} captures`); // DEBUG: REMOVE AFTER DEBUGGING
 
           let resultHook = hook.map(path, captures, instructions);
+          console.log(`[REMAP] hook.map() returned ${resultHook.constructor.name}`); // DEBUG: REMOVE AFTER DEBUGGING
 
           let promise = new RpcPromise(resultHook, []);
           this.promises.push({promise, parent, property});
