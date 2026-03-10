@@ -291,6 +291,11 @@ class RootTarget extends RpcTarget {
     return this.host.clientCallbacks.size;
   }
 
+  clearStoredClientCallbacks() {
+    this.host.clientCallbacks.clear();
+    return 0;
+  }
+
   async invokeStoredClientCallback(name: string, message: string) {
     const callback = this.host.clientCallbacks.get(name);
     if (!callback) {

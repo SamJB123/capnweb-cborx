@@ -2643,6 +2643,17 @@ class RpcMainHook extends RpcImportHook {
     }
   }
 }
+function cloneRpcExpr(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+function cloneRpcProvenance(provenance) {
+  return {
+    expr: cloneRpcExpr(provenance.expr),
+    ...provenance.captures ? { captures: cloneRpcExpr(provenance.captures) } : {},
+    ...provenance.instructions ? { instructions: cloneRpcExpr(provenance.instructions) } : {},
+    ...provenance.path ? { path: cloneRpcExpr(provenance.path) } : {}
+  };
+}
 class RpcSessionImpl {
   constructor(transport, mainHook, options) {
     this.transport = transport;
@@ -2663,6 +2674,7 @@ class RpcSessionImpl {
   exports = [];
   reverseExports = /* @__PURE__ */ new Map();
   imports = [];
+  importReplays = [];
   abortReason;
   cancelReadLoop;
   // We assign positive numbers to imports we initiate, and negative numbers to exports we
@@ -2685,6 +2697,15 @@ class RpcSessionImpl {
         ...detail ? { detail } : {}
       });
     } catch (_err) {
+    }
+  }
+  evaluateWithCurrentProvenance(expr) {
+    const previousExpr = this.currentNegativeExportProvenanceExpr;
+    this.currentNegativeExportProvenanceExpr = expr;
+    try {
+      return new Evaluator(this).evaluate(expr);
+    } finally {
+      this.currentNegativeExportProvenanceExpr = previousExpr;
     }
   }
   // Should only be called once immediately after construction.
@@ -2710,7 +2731,7 @@ class RpcSessionImpl {
           provenance: (() => {
             let mapProgram = __experimental_recordInputPath(path ?? []);
             return {
-              expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+              expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
               captures: mapProgram.captures,
               instructions: mapProgram.instructions
             };
@@ -2732,7 +2753,7 @@ class RpcSessionImpl {
         provenance: (() => {
           let mapProgram = __experimental_recordInputPath(path ?? []);
           return {
-            expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+            expr: cloneRpcExpr(this.currentNegativeExportProvenanceExpr),
             captures: mapProgram.captures,
             instructions: mapProgram.instructions
           };
@@ -2821,7 +2842,7 @@ class RpcSessionImpl {
       exp.pull = resolve().then(
         (payload) => {
           const previousExpr = this.currentNegativeExportProvenanceExpr;
-          this.currentNegativeExportProvenanceExpr = exp.provenance?.expr;
+          this.currentNegativeExportProvenanceExpr = exp.provenance?.expr ?? exp.sourceExpr;
           let value;
           try {
             value = Devaluator.devaluate(payload.value, void 0, this, payload);
@@ -2938,7 +2959,8 @@ class RpcSessionImpl {
       version: 2,
       nextExportId: this.nextExportId,
       exports: exports$1,
-      ...imports.length > 0 ? { imports } : {}
+      ...imports.length > 0 ? { imports } : {},
+      ...this.importReplays.length > 0 ? { importReplays: this.importReplays } : {}
     };
   }
   getPipeReadable(exportId) {
@@ -3126,13 +3148,20 @@ class RpcSessionImpl {
           case "push":
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];
-              let payload = new Evaluator(this).evaluate(msg[2]);
+              if (containsImportedCapabilityReference(msg[2])) {
+                this.importReplays.push({ expr: cloneRpcExpr(msg[2]) });
+                this.trace("readLoop.push.recordImportReplay", {
+                  exportId,
+                  replayCount: this.importReplays.length
+                });
+              }
+              let payload = this.evaluateWithCurrentProvenance(msg[2]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
               this.replacePositiveExport(exportId, {
                 hook,
                 refcount: 1,
-                provenance: { expr: structuredClone(msg[2]) }
+                sourceExpr: cloneRpcExpr(msg[2])
               });
               this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
@@ -3141,14 +3170,14 @@ class RpcSessionImpl {
           case "stream": {
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];
-              let payload = new Evaluator(this).evaluate(msg[2]);
+              let payload = this.evaluateWithCurrentProvenance(msg[2]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
               this.replacePositiveExport(exportId, {
                 hook,
                 refcount: 1,
-                autoRelease: true,
-                provenance: { expr: structuredClone(msg[2]) }
+                sourceExpr: cloneRpcExpr(msg[2]),
+                autoRelease: true
               });
               this.trace("readLoop.stream", { exportId, hookType: hook.constructor?.name ?? null });
               this.ensureResolvingExport(exportId);
@@ -3281,11 +3310,11 @@ class RpcSessionImpl {
     }
     if (!entry.hook) {
       if (entry.provenance) {
-        let payload = new Evaluator(this).evaluate(structuredClone(entry.provenance.expr));
+        let payload = new Evaluator(this).evaluate(cloneRpcExpr(entry.provenance.expr));
         let hook;
         if (entry.provenance.instructions) {
           const captures = (entry.provenance.captures ?? []).map((captureExpr) => {
-            const capturePayload = new Evaluator(this).evaluate(structuredClone(captureExpr));
+            const capturePayload = new Evaluator(this).evaluate(cloneRpcExpr(captureExpr));
             const captureValue = capturePayload.value;
             if (!(captureValue instanceof RpcStub)) {
               capturePayload.dispose();
@@ -3303,7 +3332,7 @@ class RpcSessionImpl {
           });
           if (payload.value instanceof RpcStub) {
             const { hook: provenanceHook, pathIfPromise } = unwrapStubAndPath(payload.value);
-            hook = provenanceHook.map(pathIfPromise ?? [], captures, structuredClone(entry.provenance.instructions));
+            hook = provenanceHook.map(pathIfPromise ?? [], captures, cloneRpcExpr(entry.provenance.instructions));
             payload.dispose();
           } else {
             hook = mapImpl.applyMap(
@@ -3311,7 +3340,7 @@ class RpcSessionImpl {
               void 0,
               payload,
               captures,
-              structuredClone(entry.provenance.instructions)
+              cloneRpcExpr(entry.provenance.instructions)
             );
           }
         } else {
@@ -3373,6 +3402,18 @@ class RpcSessionImpl {
         });
       }
     }
+    if (snapshot.importReplays && snapshot.importReplays.length > 0) {
+      this.importReplays = snapshot.importReplays.map(cloneRpcProvenance);
+      for (let replay of this.importReplays) {
+        this.trace("restoreFromSnapshot.importReplay.begin", {
+          hasCaptures: !!replay.captures?.length,
+          instructionCount: replay.instructions?.length ?? 0,
+          pathLength: replay.path?.length ?? 0
+        });
+        let payload = new Evaluator(this).evaluate(cloneRpcExpr(replay.expr));
+        payload.dispose();
+      }
+    }
     if (pendingPulls.length > 0) {
       queueMicrotask(() => {
         for (let id of pendingPulls) {
@@ -3381,6 +3422,34 @@ class RpcSessionImpl {
       });
     }
   }
+  __experimental_getImportedStub(importId) {
+    const entry = this.imports[importId];
+    if (!entry) {
+      throw new Error(`no such import ID: ${importId}`);
+    }
+    return new RpcStub(new RpcImportHook(false, entry));
+  }
+}
+function containsImportedCapabilityReference(value) {
+  if (!(value instanceof Array)) {
+    if (value && typeof value === "object") {
+      for (let nested of Object.values(value)) {
+        if (containsImportedCapabilityReference(nested)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+  if (value.length > 0 && (value[0] === "export" || value[0] === "promise")) {
+    return true;
+  }
+  for (let nested of value) {
+    if (containsImportedCapabilityReference(nested)) {
+      return true;
+    }
+  }
+  return false;
 }
 class RpcSession {
   #session;
@@ -3409,6 +3478,9 @@ class RpcSession {
   }
   __experimental_debugState() {
     return this.#session.__experimental_debugState();
+  }
+  __experimental_getImportedStub(importId) {
+    return this.#session.__experimental_getImportedStub(importId);
   }
 }
 async function __experimental_newHibernatableWebSocketRpcSession$1(webSocket, localMain, options) {
@@ -4184,6 +4256,10 @@ class RootTarget extends RpcTarget {
   }
   getStoredClientCallbackCount() {
     return this.host.clientCallbacks.size;
+  }
+  clearStoredClientCallbacks() {
+    this.host.clientCallbacks.clear();
+    return 0;
   }
   async invokeStoredClientCallback(name, message) {
     const callback = this.host.clientCallbacks.get(name);

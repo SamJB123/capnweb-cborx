@@ -645,6 +645,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
     const ws = await connectWebSocket();
     try {
       const root = newWebSocketRpcSession<any>(ws as any);
+      expect(await root.clearStoredClientCallbacks()).toBe(0);
       const callback = new RpcStub(new ClientCallback());
       const callbackName = uniqueKey("client-callback");
 
@@ -678,6 +679,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
     const ws = await connectWebSocket();
     try {
       const root = newWebSocketRpcSession<any>(ws as any);
+      expect(await root.clearStoredClientCallbacks()).toBe(0);
       const callbackTarget = new ClientCallback();
       const callback = new RpcStub(callbackTarget);
       const callbackName = uniqueKey("client-callback-survive");

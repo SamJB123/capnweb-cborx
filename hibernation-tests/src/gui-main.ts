@@ -55,8 +55,6 @@ type ScenarioState = {
   hubInstance: HubInstanceInfo;
   roomInstance: RoomInstanceInfo;
   directRoomInstance: RoomInstanceInfo;
-  hubRestoreData: unknown[];
-  roomRestoreData: unknown[];
 };
 
 const state: ScenarioState = {
@@ -97,8 +95,6 @@ const state: ScenarioState = {
   hubInstance: { before: null, current: null, hibernated: null },
   roomInstance: { before: null, current: null, hibernated: null },
   directRoomInstance: { before: null, current: null, hibernated: null },
-  hubRestoreData: [],
-  roomRestoreData: [],
 };
 
 const app = document.querySelector<HTMLDivElement>("#app");
@@ -300,17 +296,6 @@ app.innerHTML = `
       </article>
     </section>
 
-    <section class="grid">
-      <article class="panel">
-        <h2>Detected hub export restore data</h2>
-        <pre id="hub-descriptors">No restore data detected yet.</pre>
-      </article>
-      <article class="panel">
-        <h2>Detected room export restore data</h2>
-        <pre id="room-descriptors">No restore data detected yet.</pre>
-      </article>
-    </section>
-
     <section class="panel">
       <h2>Event log</h2>
       <pre id="log"></pre>
@@ -327,8 +312,6 @@ const hiddenProbeLabelInput = document.querySelector<HTMLInputElement>("#hidden-
 const hiddenProbeSecretInput = document.querySelector<HTMLInputElement>("#hidden-probe-secret")!;
 const clientStateEl = document.querySelector<HTMLElement>("#client-state")!;
 const serverStateEl = document.querySelector<HTMLElement>("#server-state")!;
-const hubDescriptorsEl = document.querySelector<HTMLElement>("#hub-descriptors")!;
-const roomDescriptorsEl = document.querySelector<HTMLElement>("#room-descriptors")!;
 const logEl = document.querySelector<HTMLElement>("#log")!;
 const counterValueEl = document.querySelector<HTMLElement>("#counter-value")!;
 const roomCountEl = document.querySelector<HTMLElement>("#room-count")!;
@@ -441,8 +424,11 @@ function formatInstanceStatus(info: HubInstanceInfo | RoomInstanceInfo) {
 
 function triggerHibernateCelebration(card: HTMLElement) {
   card.classList.remove("status-card--celebrate");
-  void card.offsetWidth;
-  card.classList.add("status-card--celebrate");
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      card.classList.add("status-card--celebrate");
+    });
+  });
 }
 
 function renderClientState(extra: Record<string, unknown> = {}) {
@@ -498,28 +484,6 @@ function renderClientState(extra: Record<string, unknown> = {}) {
   clientCallbackStatusEl.textContent = state.clientCallback
     ? `stored as ${state.clientCallbackName}${state.lastClientNotification ? ` / last: ${state.lastClientNotification}` : ""}`
     : "Not registered";
-  hubDescriptorsEl.textContent = JSON.stringify(state.hubRestoreData, null, 2);
-  roomDescriptorsEl.textContent = JSON.stringify(state.roomRestoreData, null, 2);
-}
-
-function extractRestoreDataFromDiagnostics(diagnostics: any): unknown[] {
-  const restoreData: unknown[] = [];
-
-  for (const session of diagnostics?.sessions ?? []) {
-    for (const exp of session?.debugState?.exports ?? []) {
-      if (exp?.provenance) {
-        restoreData.push({
-          sessionId: session.sessionId ?? null,
-          exportId: exp.id ?? null,
-          provenance: exp.provenance ?? null,
-          hookType: exp.hookType ?? null,
-          hasHook: !!exp.hasHook,
-        });
-      }
-    }
-  }
-
-  return restoreData;
 }
 
 async function refreshDiagnostics() {
@@ -548,19 +512,15 @@ async function refreshDiagnostics() {
   state.roomMessageCount = roomDiagnostics?.messageCount ?? state.roomMessageCount;
   state.directRoomMessageCount = roomDiagnostics?.messageCount ?? state.directRoomMessageCount;
   state.clientCallbackCount = hubDiagnostics?.counters?.clientCallbackCount ?? state.clientCallbackCount;
-  state.hubRestoreData = extractRestoreDataFromDiagnostics(hubDiagnostics);
-  state.roomRestoreData = extractRestoreDataFromDiagnostics(roomDiagnostics);
 
   serverStateEl.textContent = JSON.stringify({
     hub: {
       instance: hubInstance,
       diagnostics: hubDiagnostics,
-      detectedRestoreData: state.hubRestoreData,
     },
     room: {
       instance: roomInstance,
       diagnostics: roomDiagnostics,
-      detectedRestoreData: state.roomRestoreData,
     },
   }, null, 2);
   renderClientState();
@@ -860,12 +820,6 @@ async function waitForHibernation() {
   state.roomInstance.current = roomAfter.instanceId ?? null;
   state.hubInstance.hibernated = state.hubInstance.before !== null && state.hubInstance.before !== state.hubInstance.current;
   state.roomInstance.hibernated = state.roomInstance.before !== null && state.roomInstance.before !== state.roomInstance.current;
-  if (state.hubInstance.hibernated) {
-    triggerHibernateCelebration(hubInstanceCardEl);
-  }
-  if (state.roomInstance.hibernated) {
-    triggerHibernateCelebration(roomInstanceCardEl);
-  }
   state.lastResult = {
     hub: {
       before: state.hubInstance.before,
@@ -880,6 +834,12 @@ async function waitForHibernation() {
   };
   state.lastStatus = "success";
   renderClientState();
+  if (state.hubInstance.hibernated) {
+    triggerHibernateCelebration(hubInstanceCardEl);
+  }
+  if (state.roomInstance.hibernated) {
+    triggerHibernateCelebration(roomInstanceCardEl);
+  }
   log("Checked hub and room instance IDs before/after wait", state.lastResult);
   await refreshDiagnostics();
 }
@@ -909,9 +869,6 @@ async function waitForDirectRoomHibernation() {
   state.directRoomInstance.hibernated =
     state.directRoomInstance.before !== null &&
     state.directRoomInstance.before !== state.directRoomInstance.current;
-  if (state.directRoomInstance.hibernated) {
-    triggerHibernateCelebration(directRoomInstanceCardEl);
-  }
   state.lastResult = {
     before: state.directRoomInstance.before,
     after: state.directRoomInstance.current,
@@ -919,6 +876,9 @@ async function waitForDirectRoomHibernation() {
   };
   state.lastStatus = "success";
   renderClientState();
+  if (state.directRoomInstance.hibernated) {
+    triggerHibernateCelebration(directRoomInstanceCardEl);
+  }
   log("Checked direct room instance IDs before/after wait", state.lastResult);
   await refreshDiagnostics();
 }

@@ -1024,7 +1024,6 @@ class RpcSessionImpl implements Importer, Exporter {
             if (msg.length > 2 && typeof msg[1] === "number") {
               let exportId = msg[1];
               if (containsImportedCapabilityReference(msg[2])) {
-                this.importReplays.push({ expr: structuredClone(msg[2]) });
                 this.importReplays.push({ expr: cloneRpcExpr(msg[2]) });
                 this.trace("readLoop.push.recordImportReplay", {
                   exportId,
