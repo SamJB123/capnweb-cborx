@@ -78,9 +78,13 @@ Some notes:
 
 The following are the top-level messages that can be sent over the RPC transport.
 
-`["push", expression]`
+`["push", importId, expression]`
 
-Asks the recipient to evaluate the given expression. The expression is implicitly assigned the next sequential import ID (in the positive direction). The recipient will evaluate the expression, delivering any calls therein to the application. The final result can be pulled, or used in promise pipelining.
+Asks the recipient to evaluate the given expression. `importId` is chosen by the sender and
+identifies the positive import/export slot for the call result. The recipient must store the
+result in the corresponding export-table slot using that same ID. The recipient will evaluate the
+expression, delivering any calls therein to the application. The final result can be pulled, or
+used in promise pipelining.
 
 `["pull", importId]`
 
@@ -100,9 +104,10 @@ Instructs the recipient to release the given entry in the import table, disposin
 
 `refcount` is the total number of times this import ID has been "introduced", i.e. the number of times it has been the subject of an "export" or "promise" expression, plus 1 if it was created by a "push". The refcount must be sent to avoid a race condition if the receiving side has recently exported the same ID again. The exporter remembers how many times they have exported this ID, decrementing it by the refcount of any release messages received, and only actually releases the ID when this count reaches zero.
 
-`["stream", expression]`
+`["stream", importId, expression]`
 
-Like `["push", expression]`, asks the recipient to evaluate the given expression. The expression is implicitly assigned the next sequential import ID (in the positive direction). However, unlike "push":
+Like `["push", importId, expression]`, asks the recipient to evaluate the given expression using
+the caller-chosen positive `importId`. However, unlike "push":
 
 * Promise pipelining on the result is not supported. The caller must not refer to the import ID in subsequent expressions.
 * The expression is automatically considered "pulled". The sender does not need to send a separate "pull" message.
@@ -110,9 +115,11 @@ Like `["push", expression]`, asks the recipient to evaluate the given expression
 
 This message type is designed for streaming writes, where the result is expected to be empty, and the overhead of separate "pull" and "release" messages is high.
 
-`["pipe"]`
+`["pipe", importId]`
 
-Creates a "pipe" on the remote end. A pipe consists of a `ReadableStream` end and a `WritableStream` end. The pipe is implicitly assigned the next sequential import ID (in the positive direction), similar to `["push", expression]`.
+Creates a "pipe" on the remote end. A pipe consists of a `ReadableStream` end and a
+`WritableStream` end. `importId` is chosen by the sender and identifies the positive slot for the
+pipe, similar to `["push", importId, expression]`.
 
 The new import is not a promise. It is immediately usable as if it were a `WritableStream` — the sender can call `write`, `close`, and/or `abort` on it, using the same interface as described for the `["writable", exportId]` expression.
 

@@ -1,0 +1,509 @@
+import {
+  __experimental_newDurableObjectSessionStore,
+  __experimental_newHibernatableWebSocketRpcSession,
+  RpcTarget,
+} from "../../src/index.ts";
+import { DurableObject } from "cloudflare:workers";
+import type { RpcTraceEvent } from "../../src/rpc.ts";
+import type { HibernatableTransportTraceEvent } from "../../src/websocket.ts";
+
+interface Env {
+  HIB_RPC: DurableObjectNamespace<HibRpcDo>;
+  CHAT_ROOM: DurableObjectNamespace<ChatRoomDo>;
+}
+
+type ChatMessage = {
+  user: string;
+  text: string;
+  at: number;
+};
+
+class DurableCounterProxy extends RpcTarget {
+  constructor(
+      private ctx: DurableObjectState,
+      readonly key: string) {
+    super();
+  }
+
+  async increment(amount = 1) {
+    const current = ((await this.ctx.storage.get(`counter:${this.key}`)) as number) ?? 0;
+    const next = current + amount;
+    await this.ctx.storage.put(`counter:${this.key}`, next);
+    return next;
+  }
+
+  getValue() {
+    return this.ctx.storage.get(`counter:${this.key}`).then(v => (v as number) ?? 0);
+  }
+}
+
+class ChatRoomProxy extends RpcTarget {
+  constructor(
+      private env: Env,
+      readonly roomName: string) {
+    super();
+  }
+
+  async postMessage(user: string, text: string) {
+    return this.env.CHAT_ROOM.getByName(this.roomName).postMessage(user, text);
+  }
+
+  async listMessages() {
+    return this.env.CHAT_ROOM.getByName(this.roomName).listMessages();
+  }
+
+  async getMessageCount() {
+    return this.env.CHAT_ROOM.getByName(this.roomName).getMessageCount();
+  }
+}
+
+export class ChatRoomDo extends DurableObject {
+  instanceId: string;
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.instanceId = crypto.randomUUID();
+    console.log("[ChatRoomDo] constructor", JSON.stringify({
+      instanceId: this.instanceId,
+      at: new Date().toISOString(),
+    }));
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    console.log("[ChatRoomDo] fetch", JSON.stringify({
+      instanceId: this.instanceId,
+      pathname: url.pathname,
+      method: req.method,
+      at: new Date().toISOString(),
+    }));
+
+    if (url.pathname === "/instance-id") {
+      return Response.json({ instanceId: this.instanceId });
+    }
+
+    if (url.pathname === "/diagnostics") {
+      const messages = ((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? [];
+      return Response.json({
+        instanceId: this.instanceId,
+        messageCount: messages.length,
+        lastMessage: messages.at(-1) ?? null,
+      });
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+
+  async postMessage(user: string, text: string): Promise<{count: number; last: ChatMessage}> {
+    const messages = ((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? [];
+    const last = { user, text, at: Date.now() };
+    messages.push(last);
+    await this.ctx.storage.put("messages", messages);
+    return { count: messages.length, last };
+  }
+
+  async listMessages(): Promise<ChatMessage[]> {
+    return ((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? [];
+  }
+
+  async getMessageCount(): Promise<number> {
+    return (((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? []).length;
+  }
+}
+
+class RootTarget extends RpcTarget {
+  constructor(
+      private ctx: DurableObjectState,
+      private env: Env,
+      private host: HibRpcDo) {
+    super();
+  }
+
+  getDurableCounter(key: string) {
+    return new DurableCounterProxy(this.ctx, key);
+  }
+
+  getChatRoom(roomName: string) {
+    return new ChatRoomProxy(this.env, roomName);
+  }
+
+  square(n: number) {
+    return n * n;
+  }
+
+  echo(msg: string) {
+    return msg;
+  }
+
+  getInstanceId() {
+    return this.host.instanceId;
+  }
+
+  async delayedDurableIncrement(name: string, amount = 1, delayMs = 10) {
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    return this.getDurableCounter(name).increment(amount);
+  }
+}
+
+class HibernationRegistry {
+  constructor(
+      private ctx: DurableObjectState,
+      private env: Env) {}
+
+  describe(target: RpcTarget | Function) {
+    if (target instanceof DurableCounterProxy) {
+      return { kind: "durable-counter", key: target.key };
+    }
+    if (target instanceof ChatRoomProxy) {
+      return { kind: "chat-room", roomName: target.roomName };
+    }
+    return undefined;
+  }
+
+  restore(descriptor: { kind: string; key?: string; roomName?: string }) {
+    if (descriptor?.kind === "durable-counter" && typeof descriptor.key === "string") {
+      return new DurableCounterProxy(this.ctx, descriptor.key);
+    }
+    if (descriptor?.kind === "chat-room" && typeof descriptor.roomName === "string") {
+      return new ChatRoomProxy(this.env, descriptor.roomName);
+    }
+    throw new Error(`Unknown hibernation descriptor: ${JSON.stringify(descriptor)}`);
+  }
+}
+
+export class HibRpcDo extends DurableObject {
+  registry: HibernationRegistry;
+  sessionStore: ReturnType<typeof __experimental_newDurableObjectSessionStore>;
+  sessions = new Map<string, any>();
+  ready: Promise<void>;
+  instanceId: string;
+  restoreAttempts = 0;
+  restoreSuccesses = 0;
+  attachSessionCalls = 0;
+  webSocketMessageCount = 0;
+  reusedSessionCount = 0;
+  createdSessionCount = 0;
+  lastMessageKind: string | null = null;
+  sessionTraces = new Map<string, Array<{
+    at: number;
+    source: string;
+    phase: string;
+    detail?: Record<string, unknown>;
+  }>>();
+
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+    this.instanceId = crypto.randomUUID();
+    this.registry = new HibernationRegistry(ctx, env);
+    this.sessionStore = __experimental_newDurableObjectSessionStore(ctx.storage, "hib:");
+    const existingSockets = this.ctx.getWebSockets("capnweb");
+    console.log("[HibRpcDo] constructor", JSON.stringify({
+      instanceId: this.instanceId,
+      existingSocketCount: existingSockets.length,
+      wakeReason: existingSockets.length > 0 ? "hibernation-wake-or-restart-with-open-sockets" : "fresh-init",
+      at: new Date().toISOString(),
+    }));
+    this.ready = this.restoreSessions();
+  }
+
+  async fetch(req: Request): Promise<Response> {
+    const url = new URL(req.url);
+    console.log("[HibRpcDo] fetch", JSON.stringify({
+      instanceId: this.instanceId,
+      pathname: url.pathname,
+      method: req.method,
+      upgrade: req.headers.get("Upgrade") ?? null,
+      at: new Date().toISOString(),
+    }));
+
+    if (url.pathname === "/instance-id") {
+      return Response.json({ instanceId: this.instanceId });
+    }
+
+    if (url.pathname === "/attachments") {
+      const sockets = this.ctx.getWebSockets("capnweb");
+      const attachments = sockets.map((ws) => {
+        const attachment = (ws as any).deserializeAttachment?.();
+        return {
+          sessionId: attachment?.sessionId ?? null,
+          version: attachment?.version ?? null,
+          hasSnapshot: !!attachment?.snapshot,
+          snapshot: attachment?.snapshot ? {
+            nextExportId: attachment.snapshot.nextExportId ?? null,
+            exportCount: attachment.snapshot.exports?.length ?? 0,
+            importCount: attachment.snapshot.imports?.length ?? 0,
+          } : null,
+        };
+      });
+      return Response.json({
+        instanceId: this.instanceId,
+        count: attachments.length,
+        attachments,
+      });
+    }
+
+    if (url.pathname === "/resume-diagnostics") {
+      const sockets = this.ctx.getWebSockets("capnweb");
+      const diagnostics = sockets.map((ws) => {
+        const attachment = (ws as any).deserializeAttachment?.();
+        const sessionId = attachment?.sessionId;
+        const session = sessionId ? this.sessions.get(sessionId) : undefined;
+        let snapshot: any = null;
+        let debugState: any = null;
+        try {
+          snapshot = session?.__experimental_snapshot?.();
+        } catch (err: any) {
+          snapshot = { error: err?.message ?? `${err}` };
+        }
+        try {
+          debugState = session?.__experimental_debugState?.() ?? null;
+        } catch (err: any) {
+          debugState = { error: err?.message ?? `${err}` };
+        }
+        return {
+          sessionId: sessionId ?? null,
+          hasAttachment: !!attachment,
+          hasSnapshot: !!attachment?.snapshot,
+          hasSession: !!session,
+          stats: session?.getStats?.() ?? null,
+          attachmentSnapshot: attachment?.snapshot ? {
+            nextExportId: attachment.snapshot.nextExportId ?? null,
+            exportCount: attachment.snapshot.exports?.length ?? 0,
+            importCount: attachment.snapshot.imports?.length ?? 0,
+          } : null,
+          snapshot: snapshot ? {
+            nextExportId: snapshot.nextExportId ?? null,
+            exportCount: snapshot.exports?.length ?? 0,
+            importCount: snapshot.imports?.length ?? 0,
+            error: snapshot.error ?? null,
+          } : null,
+          debugState,
+          traces: sessionId ? (this.sessionTraces.get(sessionId) ?? []) : [],
+        };
+      });
+      return Response.json({
+        instanceId: this.instanceId,
+        sessionCount: this.sessions.size,
+        counters: {
+          restoreAttempts: this.restoreAttempts,
+          restoreSuccesses: this.restoreSuccesses,
+          attachSessionCalls: this.attachSessionCalls,
+          webSocketMessageCount: this.webSocketMessageCount,
+          reusedSessionCount: this.reusedSessionCount,
+          createdSessionCount: this.createdSessionCount,
+          lastMessageKind: this.lastMessageKind,
+        },
+        sessions: diagnostics,
+      });
+    }
+
+    if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("Expected WebSocket upgrade", { status: 426 });
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair);
+
+    this.ctx.acceptWebSocket(server, ["capnweb"]);
+    await this.ready;
+    await this.attachSession(server);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    await this.ready;
+    this.webSocketMessageCount += 1;
+    this.lastMessageKind = typeof message === "string" ? "string" : `binary(${message.byteLength})`;
+    console.log("[HibRpcDo] webSocketMessage", JSON.stringify({
+      instanceId: this.instanceId,
+      sessionId: this.getSessionId(ws) ?? null,
+      messageKind: this.lastMessageKind,
+      webSocketMessageCount: this.webSocketMessageCount,
+      at: new Date().toISOString(),
+    }));
+    const session = await this.getOrAttachSession(ws);
+    session.handleMessage(message);
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    await this.ready;
+    const sid = this.getSessionId(ws);
+    console.log("[HibRpcDo] webSocketClose", JSON.stringify({
+      instanceId: this.instanceId,
+      sessionId: sid ?? null,
+      code,
+      reason,
+      wasClean,
+      at: new Date().toISOString(),
+    }));
+    const session = sid ? this.sessions.get(sid) : undefined;
+    session?.handleClose(code, reason, wasClean);
+    if (sid) this.sessions.delete(sid);
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown) {
+    await this.ready;
+    const sid = this.getSessionId(ws);
+    console.log("[HibRpcDo] webSocketError", JSON.stringify({
+      instanceId: this.instanceId,
+      sessionId: sid ?? null,
+      error: error instanceof Error ? error.message : String(error),
+      at: new Date().toISOString(),
+    }));
+    const session = sid ? this.sessions.get(sid) : undefined;
+    session?.handleError(error);
+  }
+
+  private async restoreSessions() {
+    console.log("[HibRpcDo] restoreSessions.begin", JSON.stringify({
+      instanceId: this.instanceId,
+      socketCount: this.ctx.getWebSockets("capnweb").length,
+      at: new Date().toISOString(),
+    }));
+    for (const ws of this.ctx.getWebSockets("capnweb")) {
+      this.restoreAttempts += 1;
+      await this.attachSession(ws);
+      this.restoreSuccesses += 1;
+    }
+    console.log("[HibRpcDo] restoreSessions.end", JSON.stringify({
+      instanceId: this.instanceId,
+      restoreAttempts: this.restoreAttempts,
+      restoreSuccesses: this.restoreSuccesses,
+      sessionCount: this.sessions.size,
+      at: new Date().toISOString(),
+    }));
+  }
+
+  private async getOrAttachSession(ws: WebSocket) {
+    const sid = this.getSessionId(ws);
+    if (sid && this.sessions.has(sid)) {
+      this.reusedSessionCount += 1;
+      return this.sessions.get(sid);
+    }
+    this.createdSessionCount += 1;
+    return this.attachSession(ws);
+  }
+
+  private async attachSession(ws: WebSocket) {
+    this.attachSessionCalls += 1;
+    const knownSessionId = this.getSessionId(ws);
+    console.log("[HibRpcDo] attachSession.begin", JSON.stringify({
+      instanceId: this.instanceId,
+      knownSessionId: knownSessionId ?? null,
+      attachSessionCalls: this.attachSessionCalls,
+      at: new Date().toISOString(),
+    }));
+    const session = await __experimental_newHibernatableWebSocketRpcSession(
+        ws as any,
+        new RootTarget(this.ctx, this.env as Env, this),
+        {
+          hibernationRegistry: this.registry as any,
+          sessionStore: this.sessionStore,
+          onSendError(err) { return err; },
+          sessionId: knownSessionId,
+          __experimental_trace: (event: RpcTraceEvent | HibernatableTransportTraceEvent) => {
+            const sessionId = this.getSessionId(ws) ?? knownSessionId ?? "pending";
+            this.pushTrace(sessionId, event);
+            if (
+              event.phase === "receive" ||
+              event.phase === "readLoop.push" ||
+              event.phase === "readLoop.pull" ||
+              event.phase === "readLoop.resolve" ||
+              event.phase === "readLoop.reject" ||
+              event.phase === "send" ||
+              event.phase === "ensureResolvingExport.start" ||
+              event.phase === "ensureResolvingExport.resolve" ||
+              event.phase === "ensureResolvingExport.reject" ||
+              event.phase === "getOrRestoreExportHook.restore"
+            ) {
+              console.log("[HibRpcDo] trace", JSON.stringify({
+                instanceId: this.instanceId,
+                sessionId,
+                source: event.source,
+                phase: event.phase,
+                detail: event.detail ?? null,
+                at: new Date().toISOString(),
+              }));
+            }
+          },
+        });
+    this.sessions.set(session.sessionId, session);
+    if (knownSessionId && knownSessionId !== session.sessionId) {
+      const pending = this.sessionTraces.get(knownSessionId);
+      if (pending) {
+        this.sessionTraces.delete(knownSessionId);
+        this.sessionTraces.set(session.sessionId, pending);
+      }
+    }
+    this.pushTrace(session.sessionId, {
+      source: "worker",
+      phase: "attachSession.complete",
+      detail: { knownSessionId: knownSessionId ?? null },
+    });
+    console.log("[HibRpcDo] attachSession.end", JSON.stringify({
+      instanceId: this.instanceId,
+      sessionId: session.sessionId,
+      sessionCount: this.sessions.size,
+      at: new Date().toISOString(),
+    }));
+    return session;
+  }
+
+  private getSessionId(ws: WebSocket): string | undefined {
+    const attachment = (ws as any).deserializeAttachment?.();
+    if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
+      return attachment.sessionId;
+    }
+    return undefined;
+  }
+
+  private pushTrace(
+      sessionId: string,
+      event: {
+        source: string;
+        phase: string;
+        detail?: Record<string, unknown>;
+      }) {
+    const current = this.sessionTraces.get(sessionId) ?? [];
+    current.push({
+      at: Date.now(),
+      source: event.source,
+      phase: event.phase,
+      ...(event.detail ? { detail: event.detail } : {}),
+    });
+    if (current.length > 200) {
+      current.splice(0, current.length - 200);
+    }
+    this.sessionTraces.set(sessionId, current);
+  }
+}
+
+export default {
+  async fetch(request: Request, env: Env) {
+    const url = new URL(request.url);
+    if (
+        url.pathname === "/ws" ||
+        url.pathname === "/instance-id" ||
+        url.pathname === "/attachments" ||
+        url.pathname === "/resume-diagnostics") {
+      const stub = env.HIB_RPC.getByName("test");
+      return stub.fetch(request);
+    }
+
+    if (
+        url.pathname === "/chat-room-instance" ||
+        url.pathname === "/chat-room-diagnostics") {
+      const roomName = url.searchParams.get("room");
+      if (!roomName) {
+        return new Response("Missing room query parameter", { status: 400 });
+      }
+      const stub = env.CHAT_ROOM.getByName(roomName);
+      const innerUrl = new URL(request.url);
+      innerUrl.pathname = url.pathname === "/chat-room-instance" ? "/instance-id" : "/diagnostics";
+      return stub.fetch(new Request(innerUrl.toString(), request));
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};

@@ -4,6 +4,10 @@
 
 import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
 import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
+import type {
+  HibernatableCapabilityDescriptor,
+  HibernatableRpcTargetRegistry,
+} from "./hibernation.js";
 
 // Polyfill Symbol.dispose for browsers that don't support it yet
 if (!Symbol.dispose) {
@@ -28,6 +32,24 @@ if (!Promise.withResolvers) {
 }
 
 let workersModule: any = (globalThis as any)[WORKERS_MODULE_SYMBOL];
+
+const DEBUG_OBJECT_IDS = new WeakMap<object, number>();
+let DEBUG_OBJECT_ID_SEQ = 1;
+
+function getDebugObjectId(value: unknown): number | null {
+  if ((typeof value !== "object" && typeof value !== "function") || value === null) {
+    return null;
+  }
+
+  let existing = DEBUG_OBJECT_IDS.get(value as object);
+  if (existing !== undefined) {
+    return existing;
+  }
+
+  let next = DEBUG_OBJECT_ID_SEQ++;
+  DEBUG_OBJECT_IDS.set(value as object, next);
+  return next;
+}
 
 export interface RpcTarget {
   [__RPC_TARGET_BRAND]: never;
@@ -1886,6 +1908,79 @@ class TargetStubHook extends ValueStubHook {
   onBroken(callback: (error: any) => void): void {
     // TODO: Should RpcTargets be able to implement onRpcBroken?
   }
+
+  describeForHibernation(
+      registry: HibernatableRpcTargetRegistry): HibernatableCapabilityDescriptor | undefined {
+    if (this.target) {
+      return registry.describe(this.target);
+    }
+
+    return undefined;
+  }
+
+  __experimental_debugIdentity() {
+    return {
+      hookObjectId: getDebugObjectId(this),
+      targetObjectId: getDebugObjectId(this.target),
+      targetType: this.target?.constructor?.name ?? null,
+      parentObjectId: getDebugObjectId(this.parent),
+      hasRefcount: !!this.refcount,
+      refcountObjectId: getDebugObjectId(this.refcount),
+      refcountValue: this.refcount?.count ?? null,
+    };
+  }
+}
+
+export function __experimental_describeStubHookForHibernation(
+    hook: StubHook,
+    registry: HibernatableRpcTargetRegistry): HibernatableCapabilityDescriptor | undefined {
+  if (hook instanceof TargetStubHook) {
+    return hook.describeForHibernation(registry);
+  }
+
+  return undefined;
+}
+
+export function __experimental_restoreStubHookFromHibernation(
+    descriptor: HibernatableCapabilityDescriptor,
+    registry: HibernatableRpcTargetRegistry): StubHook {
+  return TargetStubHook.create(registry.restore(descriptor), undefined);
+}
+
+export function __experimental_debugStubHookIdentity(hook: StubHook): Record<string, unknown> {
+  const customDebug = (hook as any).__experimental_debugIdentity?.();
+  if (customDebug) {
+    return customDebug;
+  }
+
+  if (hook instanceof TargetStubHook) {
+    return {
+      hookType: "TargetStubHook",
+      ...hook.__experimental_debugIdentity(),
+    };
+  }
+
+  return {
+    hookType: hook.constructor?.name ?? null,
+    hookObjectId: getDebugObjectId(hook),
+  };
+}
+
+export function __experimental_debugRpcReference(value: unknown): Record<string, unknown> {
+  if (!(value instanceof RpcStub)) {
+    return {
+      kind: typeof value,
+      isRpcStub: false,
+    };
+  }
+
+  const raw = value[RAW_STUB];
+  return {
+    kind: value instanceof RpcPromise ? "RpcPromise" : "RpcStub",
+    isRpcStub: true,
+    pathIfPromise: raw.pathIfPromise ?? null,
+    hook: __experimental_debugStubHookIdentity(raw.hook),
+  };
 }
 
 // StubHook derived from a Promise for some other StubHook. Waits for the promise and then

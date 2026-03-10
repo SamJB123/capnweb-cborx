@@ -2,8 +2,26 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { StubHook, RpcPayload, RpcStub, PropertyPath, PayloadStubHook, ErrorStubHook, RpcTarget, unwrapStubAndPath, streamImpl } from "./core.js";
+import {
+  StubHook,
+  RpcPayload,
+  RpcStub,
+  PropertyPath,
+  PayloadStubHook,
+  ErrorStubHook,
+  RpcTarget,
+  unwrapStubAndPath,
+  streamImpl,
+  __experimental_describeStubHookForHibernation,
+  __experimental_debugStubHookIdentity,
+  __experimental_restoreStubHookFromHibernation,
+} from "./core.js";
 import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize } from "./serialize.js";
+import type {
+  HibernatableCapabilityDescriptor,
+  HibernatableRpcTargetRegistry,
+  RpcSessionSnapshot,
+} from "./hibernation.js";
 
 /**
  * Interface for an RPC transport, which is a simple bidirectional message stream. Implement this
@@ -37,8 +55,9 @@ export interface RpcTransport {
 
 // Entry on the exports table.
 type ExportTableEntry = {
-  hook: StubHook,
+  hook?: StubHook,
   refcount: number,
+  descriptor?: HibernatableCapabilityDescriptor,
   pull?: Promise<void>,
 
   // If true, the export should be automatically released (with refcount 1) after its "resolve"
@@ -166,6 +185,17 @@ class ImportTableEntry {
       this.remoteRefcount = 0;
     }
   }
+
+  __experimental_debugState() {
+    return {
+      id: this.importId,
+      localRefcount: this.localRefcount,
+      remoteRefcount: this.remoteRefcount,
+      hasResolution: !!this.resolution,
+      resolutionType: this.resolution?.constructor?.name ?? null,
+      hasActivePull: !!this.activePull,
+    };
+  }
 };
 
 class RpcImportHook extends StubHook {
@@ -280,6 +310,14 @@ class RpcImportHook extends StubHook {
       this.entry.onBroken(callback);
     }
   }
+
+  __experimental_debugIdentity() {
+    return {
+      hookType: this.constructor?.name ?? null,
+      isPromise: this.isPromise,
+      entry: this.entry?.__experimental_debugState() ?? null,
+    };
+  }
 }
 
 class RpcMainHook extends RpcImportHook {
@@ -316,6 +354,53 @@ export type RpcSessionOptions = {
    * to serialize the error with the stack omitted.
    */
   onSendError?: (error: Error) => Error | void;
+
+  /**
+   * EXPERIMENTAL: Registry used to describe and rebind exported RpcTargets across hibernation.
+   */
+  __experimental_hibernationRegistry?: HibernatableRpcTargetRegistry;
+
+  /**
+   * EXPERIMENTAL: Restore a session from a previously-captured snapshot.
+   */
+  __experimental_restoreSnapshot?: RpcSessionSnapshot;
+
+  /**
+   * EXPERIMENTAL: Low-level trace hook for observing session message flow.
+   */
+  __experimental_trace?: (event: RpcTraceEvent) => void;
+};
+
+export type RpcTraceEvent = {
+  source: "rpc";
+  phase: string;
+  detail?: Record<string, unknown>;
+};
+
+export type RpcSessionDebugState = {
+  nextExportId: number;
+  abortReason: string | null;
+  pullCount: number;
+  registryBackedExportRestoreCount: number;
+  exports: Array<{
+    id: number;
+    refcount: number;
+    hasHook: boolean;
+    hookType: string | null;
+    hookIdentity: Record<string, unknown> | null;
+    descriptor: HibernatableCapabilityDescriptor | null;
+    hasPull: boolean;
+    autoRelease: boolean;
+    hasPipeReadable: boolean;
+  }>;
+  imports: Array<{
+    id: number;
+    localRefcount: number;
+    remoteRefcount: number;
+    hasResolution: boolean;
+    resolutionType: string | null;
+    hasActivePull: boolean;
+  }>;
 };
 
 class RpcSessionImpl implements Importer, Exporter {
@@ -339,6 +424,7 @@ class RpcSessionImpl implements Importer, Exporter {
   // Sparse array of onBrokenCallback registrations. Items are strictly appended to the end but
   // may be deleted from the middle (hence leaving the array sparse).
   onBrokenCallbacks: ((error: any) => void)[] = [];
+  private registryBackedExportRestoreCount = 0;
 
   constructor(private transport: RpcTransport, mainHook: StubHook,
       private options: RpcSessionOptions) {
@@ -348,11 +434,28 @@ class RpcSessionImpl implements Importer, Exporter {
     // Import zero is the other side's bootstrap object.
     this.imports.push(new ImportTableEntry(this, 0, false));
 
+    const snapshot = options.__experimental_restoreSnapshot;
+    if (snapshot) {
+      this.restoreFromSnapshot(snapshot);
+    }
+
     let rejectFunc: (error: any) => void;;
     let abortPromise = new Promise<never>((resolve, reject) => { rejectFunc = reject; });
     this.cancelReadLoop = rejectFunc!;
 
     this.readLoop(abortPromise).catch(err => this.abort(err));
+  }
+
+  private trace(phase: string, detail?: Record<string, unknown>) {
+    try {
+      this.options.__experimental_trace?.({
+        source: "rpc",
+        phase,
+        ...(detail ? { detail } : {}),
+      });
+    } catch (_err) {
+      // Ignore trace hook failures.
+    }
   }
 
   // Should only be called once immediately after construction.
@@ -372,11 +475,13 @@ class RpcSessionImpl implements Importer, Exporter {
     let existingExportId = this.reverseExports.get(hook);
     if (existingExportId !== undefined) {
       ++this.exports[existingExportId].refcount;
+      this.trace("exportStub.reuse", { exportId: existingExportId, refcount: this.exports[existingExportId].refcount });
       return existingExportId;
     } else {
       let exportId = this.nextExportId--;
       this.exports[exportId] = { hook, refcount: 1 };
       this.reverseExports.set(hook, exportId);
+      this.trace("exportStub.new", { exportId, hookType: hook.constructor?.name ?? null });
       // TODO: Use onBroken().
       return exportId;
     }
@@ -389,6 +494,7 @@ class RpcSessionImpl implements Importer, Exporter {
     let exportId = this.nextExportId--;
     this.exports[exportId] = { hook, refcount: 1 };
     this.reverseExports.set(hook, exportId);
+    this.trace("exportPromise.new", { exportId, hookType: hook.constructor?.name ?? null });
 
     // Automatically start resolving any promises we send.
     this.ensureResolvingExport(exportId);
@@ -404,17 +510,35 @@ class RpcSessionImpl implements Importer, Exporter {
   private releaseExport(exportId: ExportId, refcount: number) {
     let entry = this.exports[exportId];
     if (!entry) {
-      throw new Error(`no such export ID: ${exportId}`);
+      this.trace("releaseExport.missing", { exportId, refcount });
+      return;
     }
     if (entry.refcount < refcount) {
       throw new Error(`refcount would go negative: ${entry.refcount} < ${refcount}`);
     }
     entry.refcount -= refcount;
+    this.trace("releaseExport", { exportId, refcount, remainingRefcount: entry.refcount });
     if (entry.refcount === 0) {
       delete this.exports[exportId];
-      this.reverseExports.delete(entry.hook);
-      entry.hook.dispose();
+      if (entry.hook) {
+        this.reverseExports.delete(entry.hook);
+        entry.hook.dispose();
+      }
     }
+  }
+
+  private replacePositiveExport(exportId: ExportId, entry: ExportTableEntry) {
+    if (exportId < 0) {
+      throw new Error(`Positive export slot expected, got ${exportId}`);
+    }
+
+    let previous = this.exports[exportId];
+    if (previous?.hook) {
+      this.reverseExports.delete(previous.hook);
+      previous.hook.dispose();
+    }
+
+    this.exports[exportId] = entry;
   }
 
   onSendError(error: Error): Error | void {
@@ -426,11 +550,21 @@ class RpcSessionImpl implements Importer, Exporter {
   private ensureResolvingExport(exportId: ExportId) {
     let exp = this.exports[exportId];
     if (!exp) {
-      throw new Error(`no such export ID: ${exportId}`);
+      this.trace("ensureResolvingExport.missing", { exportId });
+      return;
     }
     if (!exp.pull) {
+      this.trace("ensureResolvingExport.start", {
+        exportId,
+        hasHook: !!exp.hook,
+        descriptorKind: exp.descriptor?.kind ?? null,
+      });
       let resolve = async () => {
-        let hook = exp.hook;
+        let hook = this.getOrRestoreExportHook(exportId);
+        this.trace("ensureResolvingExport.hookReady", {
+          exportId,
+          hookType: hook.constructor?.name ?? null,
+        });
         for (;;) {
           let payload = await hook.pull();
           if (payload.value instanceof RpcStub) {
@@ -461,10 +595,15 @@ class RpcSessionImpl implements Importer, Exporter {
           // We don't transfer ownership of stubs in the payload since the payload
           // belongs to the hook which sticks around to handle pipelined requests.
           let value = Devaluator.devaluate(payload.value, undefined, this, payload);
+          this.trace("ensureResolvingExport.resolve", { exportId, valueType: typeof payload.value });
           this.send(["resolve", exportId, value]);
           if (autoRelease) this.releaseExport(exportId, 1);
         },
         error => {
+          this.trace("ensureResolvingExport.reject", {
+            exportId,
+            error: error instanceof Error ? error.message : String(error),
+          });
           this.send(["reject", exportId, Devaluator.devaluate(error, undefined, this)]);
           if (autoRelease) this.releaseExport(exportId, 1);
         }
@@ -473,6 +612,10 @@ class RpcSessionImpl implements Importer, Exporter {
           // If serialization failed, report the serialization error, which should
           // itself always be serializable.
           try {
+            this.trace("ensureResolvingExport.rejectSerialization", {
+              exportId,
+              error: error instanceof Error ? error.message : String(error),
+            });
             this.send(["reject", exportId, Devaluator.devaluate(error, undefined, this)]);
             if (autoRelease) this.releaseExport(exportId, 1);
           } catch (error2) {
@@ -525,7 +668,69 @@ class RpcSessionImpl implements Importer, Exporter {
   }
 
   getExport(idx: ExportId): StubHook | undefined {
-    return this.exports[idx]?.hook;
+    let entry = this.exports[idx];
+    if (!entry) return undefined;
+    return this.getOrRestoreExportHook(idx);
+  }
+
+  __experimental_snapshot(): RpcSessionSnapshot {
+    let registry = this.options.__experimental_hibernationRegistry;
+    if (!registry) {
+      throw new Error("Can't snapshot RPC session without a hibernation registry.");
+    }
+
+    const imports = [] as NonNullable<RpcSessionSnapshot["imports"]>;
+    for (let i in this.imports) {
+      let id = Number(i);
+      if (id === 0) continue;
+
+      let entry = this.imports[i];
+      if (!entry) continue;
+      if (entry.resolution) continue;
+
+      imports.push({
+        id,
+        remoteRefcount: entry.remoteRefcount,
+      });
+    }
+
+    const exports = [] as RpcSessionSnapshot["exports"];
+    for (let i in this.exports) {
+      let id = Number(i);
+      if (id >= 0) continue;
+
+      let entry = this.exports[i];
+      if (!entry) continue;
+
+      let descriptor = entry.descriptor;
+      if (!descriptor && entry.hook) {
+        descriptor = __experimental_describeStubHookForHibernation(entry.hook, registry);
+        if (descriptor) {
+          entry.descriptor = descriptor;
+        }
+      }
+
+      if (!descriptor) {
+        console.error(
+            `[capnweb] Export ${id} is not hibernatable (hook type: ${entry.hook?.constructor?.name ?? "none"}). ` +
+            `It will be lost on hibernation. Register it in the hibernation registry to fix this.`);
+        continue;
+      }
+
+      exports.push({
+        id,
+        refcount: entry.refcount,
+        descriptor,
+        ...(entry.pull ? {pulling: true} : {}),
+      });
+    }
+
+    return {
+      version: 1,
+      nextExportId: this.nextExportId,
+      exports,
+      ...(imports.length > 0 ? {imports} : {}),
+    };
   }
 
   getPipeReadable(exportId: ExportId): ReadableStream {
@@ -541,12 +746,11 @@ class RpcSessionImpl implements Importer, Exporter {
   createPipe(readable: ReadableStream, readableHook: StubHook): ImportId {
     if (this.abortReason) throw this.abortReason;
 
-    this.send(["pipe"]);
-
     let importId = this.imports.length;
     // The pipe import is not a promise -- it's immediately usable as a writable stream.
     let entry = new ImportTableEntry(this, importId, false);
     this.imports.push(entry);
+    this.send(["pipe", importId]);
 
     // Create a proxy WritableStream from the import hook and pump the ReadableStream into it.
     let hook = new RpcImportHook(/*isPromise=*/false, entry);
@@ -577,6 +781,11 @@ class RpcSessionImpl implements Importer, Exporter {
       throw err;
     }
 
+    this.trace("send", {
+      kind: msg instanceof Array ? msg[0] : typeof msg,
+      byteLength: msgText.length,
+    });
+
     this.transport.send(msgText)
         // If send fails, abort the connection, but don't try to send an abort message since
         // that'll probably also fail.
@@ -587,6 +796,9 @@ class RpcSessionImpl implements Importer, Exporter {
 
   sendCall(id: ImportId, path: PropertyPath, args?: RpcPayload): RpcImportHook {
     if (this.abortReason) throw this.abortReason;
+
+    let entry = new ImportTableEntry(this, this.imports.length, false);
+    this.imports.push(entry);
 
     let value: Array<any> = ["pipeline", id, path];
     if (args) {
@@ -599,16 +811,20 @@ class RpcSessionImpl implements Importer, Exporter {
       // Serializing the payload takes ownership of all stubs within, so the payload itself does
       // not need to be disposed.
     }
-    this.send(["push", value]);
-
-    let entry = new ImportTableEntry(this, this.imports.length, false);
-    this.imports.push(entry);
+    this.send(["push", entry.importId, value]);
+    this.trace("sendCall", { importId: entry.importId, targetImportId: id, pathLength: path.length, hasArgs: !!args });
     return new RpcImportHook(/*isPromise=*/true, entry);
   }
 
   sendStream(id: ImportId, path: PropertyPath, args: RpcPayload)
       : {promise: Promise<void>, size: number} {
     if (this.abortReason) throw this.abortReason;
+
+    let importId = this.imports.length;
+    let entry = new ImportTableEntry(this, importId, /*pulling=*/true);
+    entry.remoteRefcount = 0;
+    entry.localRefcount = 1;
+    this.imports.push(entry);
 
     let value: Array<any> = ["pipeline", id, path];
     let devalue = Devaluator.devaluate(args.value, undefined, this, args);
@@ -617,17 +833,13 @@ class RpcSessionImpl implements Importer, Exporter {
     // TODO: Clean this up somehow.
     value.push((<Array<unknown>>devalue)[0]);
 
-    let size = this.send(["stream", value]);
+    let size = this.send(["stream", importId, value]);
 
     // Create the import entry in "already pulling" state (pulling=true), since stream messages
     // are automatically pulled. Set remoteRefcount to 0 so that resolve() won't send a release
     // message — the server implicitly releases the export after sending the resolve. Set
     // localRefcount to 1 so that resolve() doesn't treat this as already-disposed.
-    let importId = this.imports.length;
-    let entry = new ImportTableEntry(this, importId, /*pulling=*/true);
-    entry.remoteRefcount = 0;
-    entry.localRefcount = 1;
-    this.imports.push(entry);
+    this.trace("sendStream", { importId, targetImportId: id, pathLength: path.length, size });
 
     // Await the resolution, then dispose the result payload and clean up the import table entry.
     // (Normally, sendRelease() cleans up the import table, but since remoteRefcount is 0, we
@@ -664,6 +876,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     let entry = new ImportTableEntry(this, this.imports.length, false);
     this.imports.push(entry);
+    this.trace("sendMap", { importId: entry.importId, targetImportId: id, pathLength: path.length, captureCount: captures.length });
     return new RpcImportHook(/*isPromise=*/true, entry);
   }
 
@@ -671,12 +884,14 @@ class RpcSessionImpl implements Importer, Exporter {
     if (this.abortReason) throw this.abortReason;
 
     this.send(["pull", id]);
+    this.trace("sendPull", { importId: id });
   }
 
   sendRelease(id: ImportId, remoteRefcount: number) {
     if (this.abortReason) return;
 
     this.send(["release", id, remoteRefcount]);
+    this.trace("sendRelease", { importId: id, remoteRefcount });
     delete this.imports[id];
   }
 
@@ -702,6 +917,10 @@ class RpcSessionImpl implements Importer, Exporter {
     }
 
     this.abortReason = error;
+    this.trace("abort", {
+      error: error instanceof Error ? error.message : String(error),
+      trySendAbortMessage,
+    });
     if (this.onBatchDone) {
       this.onBatchDone.reject(error);
     }
@@ -730,7 +949,7 @@ class RpcSessionImpl implements Importer, Exporter {
       this.imports[i].abort(error);
     }
     for (let i in this.exports) {
-      this.exports[i].hook.dispose();
+      this.exports[i].hook?.dispose();
     }
   }
 
@@ -738,12 +957,17 @@ class RpcSessionImpl implements Importer, Exporter {
     while (!this.abortReason) {
       let msg = JSON.parse(await Promise.race([this.transport.receive(), abortPromise]));
       if (this.abortReason) break;  // check again before processing
+      this.trace("receive", {
+        kind: msg instanceof Array ? msg[0] : typeof msg,
+        length: msg instanceof Array ? msg.length : null,
+      });
 
       if (msg instanceof Array) {
         switch (msg[0]) {
-          case "push":  // ["push", Expression]
-            if (msg.length > 1) {
-              let payload = new Evaluator(this).evaluate(msg[1]);
+          case "push":  // ["push", ImportId, Expression]
+            if (msg.length > 2 && typeof msg[1] === "number") {
+              let exportId = msg[1];
+              let payload = new Evaluator(this).evaluate(msg[2]);
               let hook = new PayloadStubHook(payload);
 
               // It's possible for a rejection to occur before the client gets a chance to send
@@ -751,23 +975,25 @@ class RpcSessionImpl implements Importer, Exporter {
               // treated as an unhandled rejection on our end.
               hook.ignoreUnhandledRejections();
 
-              this.exports.push({ hook, refcount: 1 });
+              this.replacePositiveExport(exportId, { hook, refcount: 1 });
+              this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
             }
             break;
 
-          case "stream": {  // ["stream", Expression]
+          case "stream": {  // ["stream", ImportId, Expression]
             // Like "push", but:
             // - Promise pipelining on the result is not supported.
             // - The export is automatically considered "pulled".
             // - Once the "resolve" is sent, the export is implicitly released.
-            if (msg.length > 1) {
-              let payload = new Evaluator(this).evaluate(msg[1]);
+            if (msg.length > 2 && typeof msg[1] === "number") {
+              let exportId = msg[1];
+              let payload = new Evaluator(this).evaluate(msg[2]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
 
-              let exportId = this.exports.length;
-              this.exports.push({ hook, refcount: 1, autoRelease: true });
+              this.replacePositiveExport(exportId, { hook, refcount: 1, autoRelease: true });
+              this.trace("readLoop.stream", { exportId, hookType: hook.constructor?.name ?? null });
 
               // Automatically pull since stream messages are always pulled.
               this.ensureResolvingExport(exportId);
@@ -776,19 +1002,25 @@ class RpcSessionImpl implements Importer, Exporter {
             break;
           }
 
-          case "pipe": {  // ["pipe"]
+          case "pipe": {  // ["pipe", ImportId]
             // Create a TransformStream. The writable end becomes the export (so the sender can
             // write/close/abort it). The readable end is stashed for later retrieval via
             // ["readable", importId].
-            let { readable, writable } = new TransformStream();
-            let hook = streamImpl.createWritableStreamHook(writable);
-            this.exports.push({ hook, refcount: 1, pipeReadable: readable });
-            continue;
+            if (msg.length > 1 && typeof msg[1] === "number") {
+              let exportId = msg[1];
+              let { readable, writable } = new TransformStream();
+              let hook = streamImpl.createWritableStreamHook(writable);
+              this.replacePositiveExport(exportId, { hook, refcount: 1, pipeReadable: readable });
+              this.trace("readLoop.pipe", { exportId });
+              continue;
+            }
+            break;
           }
 
           case "pull": {  // ["pull", ImportId]
             let exportId = msg[1];
             if (typeof exportId == "number") {
+              this.trace("readLoop.pull", { exportId });
               this.ensureResolvingExport(exportId);
               continue;
             }
@@ -799,6 +1031,7 @@ class RpcSessionImpl implements Importer, Exporter {
           case "reject": {  // ["reject", ExportId, Expression]
             let importId = msg[1];
             if (typeof importId == "number" && msg.length > 2) {
+              this.trace(`readLoop.${msg[0]}`, { importId });
               let imp = this.imports[importId];
               if (imp) {
                 if (msg[0] == "resolve") {
@@ -829,6 +1062,7 @@ class RpcSessionImpl implements Importer, Exporter {
             let exportId = msg[1];
             let refcount = msg[2];
             if (typeof exportId == "number" && typeof refcount == "number") {
+              this.trace("readLoop.release", { exportId, refcount });
               this.releaseExport(exportId, refcount);
               continue;
             }
@@ -836,6 +1070,7 @@ class RpcSessionImpl implements Importer, Exporter {
           }
 
           case "abort": {
+            this.trace("readLoop.abort");
             let payload = new Evaluator(this).evaluate(msg[1]);
             payload.dispose();  // just in case -- should be no-op
             this.abort(payload, false);
@@ -871,6 +1106,117 @@ class RpcSessionImpl implements Importer, Exporter {
     }
     return result;
   }
+
+  __experimental_debugState(): RpcSessionDebugState {
+    const exports: RpcSessionDebugState["exports"] = [];
+    for (let i in this.exports) {
+      const id = Number(i);
+      const entry = this.exports[i];
+      if (!entry) continue;
+      exports.push({
+        id,
+        refcount: entry.refcount,
+        hasHook: !!entry.hook,
+        hookType: entry.hook?.constructor?.name ?? null,
+        hookIdentity: entry.hook ? __experimental_debugStubHookIdentity(entry.hook) : null,
+        descriptor: entry.descriptor ?? null,
+        hasPull: !!entry.pull,
+        autoRelease: !!entry.autoRelease,
+        hasPipeReadable: !!entry.pipeReadable,
+      });
+    }
+
+    const imports: RpcSessionDebugState["imports"] = [];
+    for (let i in this.imports) {
+      const entry = this.imports[i];
+      if (!entry) continue;
+      imports.push(entry.__experimental_debugState());
+    }
+
+    return {
+      nextExportId: this.nextExportId,
+      abortReason: this.abortReason ? String(this.abortReason) : null,
+      pullCount: this.pullCount,
+      registryBackedExportRestoreCount: this.registryBackedExportRestoreCount,
+      exports,
+      imports,
+    };
+  }
+
+  private getOrRestoreExportHook(exportId: ExportId): StubHook {
+    const entry = this.exports[exportId];
+    if (!entry) {
+      throw new Error(`no such export ID: ${exportId}`);
+    }
+
+    if (!entry.hook) {
+      const registry = this.options.__experimental_hibernationRegistry;
+      if (!registry || !entry.descriptor) {
+        throw new Error(`Export ${exportId} can't be restored after hibernation.`);
+      }
+
+      entry.hook = __experimental_restoreStubHookFromHibernation(entry.descriptor, registry);
+      this.registryBackedExportRestoreCount += 1;
+      this.reverseExports.set(entry.hook, exportId);
+      this.trace("getOrRestoreExportHook.restore", {
+        exportId,
+        descriptorKind: entry.descriptor.kind,
+        hookType: entry.hook.constructor?.name ?? null,
+      });
+    }
+
+    return entry.hook;
+  }
+
+  private restoreFromSnapshot(snapshot: RpcSessionSnapshot) {
+    if (snapshot.version !== 1) {
+      throw new Error(`Unsupported RPC session snapshot version: ${snapshot.version}`);
+    }
+
+    this.nextExportId = snapshot.nextExportId;
+    const pendingPulls: ExportId[] = [];
+    this.trace("restoreFromSnapshot.begin", {
+      nextExportId: snapshot.nextExportId,
+      exportCount: snapshot.exports.length,
+      importCount: snapshot.imports?.length ?? 0,
+    });
+
+    for (let exp of snapshot.exports) {
+      this.exports[exp.id] = {
+        refcount: exp.refcount,
+        descriptor: exp.descriptor,
+      };
+      this.trace("restoreFromSnapshot.export", {
+        exportId: exp.id,
+        refcount: exp.refcount,
+        descriptorKind: exp.descriptor.kind,
+        pulling: !!exp.pulling,
+      });
+      if (exp.pulling) {
+        pendingPulls.push(exp.id);
+      }
+    }
+
+    if (snapshot.imports) {
+      for (let imp of snapshot.imports) {
+        let entry = new ImportTableEntry(this, imp.id, false);
+        entry.remoteRefcount = imp.remoteRefcount;
+        this.imports[imp.id] = entry;
+        this.trace("restoreFromSnapshot.import", {
+          importId: imp.id,
+          remoteRefcount: imp.remoteRefcount,
+        });
+      }
+    }
+
+    if (pendingPulls.length > 0) {
+      queueMicrotask(() => {
+        for (let id of pendingPulls) {
+          this.ensureResolvingExport(id);
+        }
+      });
+    }
+  }
 }
 
 // Public interface that wraps RpcSession and hides private implementation details (even from
@@ -900,5 +1246,13 @@ export class RpcSession {
 
   drain(): Promise<void> {
     return this.#session.drain();
+  }
+
+  __experimental_snapshot(): RpcSessionSnapshot {
+    return this.#session.__experimental_snapshot();
+  }
+
+  __experimental_debugState(): RpcSessionDebugState {
+    return this.#session.__experimental_debugState();
   }
 }

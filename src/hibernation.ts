@@ -1,0 +1,102 @@
+// Copyright (c) 2025 Cloudflare, Inc.
+// Licensed under the MIT license found in the LICENSE.txt file or at:
+//     https://opensource.org/license/mit
+
+import type { RpcTarget } from "./core.js";
+
+/**
+ * Describes a capability that can be rebound after the hosting process wakes from hibernation.
+ *
+ * The library treats the contents as application-defined. A common pattern is to encode a Durable
+ * Object namespace plus object ID.
+ */
+export type HibernatableCapabilityDescriptor = {
+  kind: string;
+  [key: string]: unknown;
+};
+
+/**
+ * Application-provided registry used to persist and rebind hibernatable exported capabilities.
+ *
+ * V1 support is intentionally narrow: only exported capabilities that can be described and later
+ * recreated through this registry are resumable after hibernation.
+ */
+export interface HibernatableRpcTargetRegistry {
+  describe(target: RpcTarget | Function): HibernatableCapabilityDescriptor | undefined;
+  restore(descriptor: HibernatableCapabilityDescriptor): RpcTarget | Function;
+}
+
+export type RpcSessionSnapshotExport = {
+  id: number;
+  refcount: number;
+  descriptor: HibernatableCapabilityDescriptor;
+  /** If true, this export had an in-flight pull at snapshot time.
+   *  On restore the pull will be re-triggered automatically so the
+   *  client receives the resolve/reject it is still waiting for. */
+  pulling?: boolean;
+};
+
+/**
+ * Snapshot of a peer-imported capability (i.e. the peer exported an RpcTarget to us).
+ *
+ * Unlike exports, imports don't need a registry — the real object lives on the peer.
+ * We just need to remember the import ID and refcount so we can continue sending
+ * RPC messages referencing the correct ID after hibernation. The peer's export table
+ * still maps this ID to the real object because the WebSocket was never disconnected.
+ */
+export type RpcSessionSnapshotImport = {
+  id: number;
+  remoteRefcount: number;
+};
+
+export type RpcSessionSnapshot = {
+  version: 1;
+  nextExportId: number;
+  exports: RpcSessionSnapshotExport[];
+  /** Peer-imported capabilities (stubs pointing back to the peer's exports).
+   *  Only unresolved imports are snapshotted — resolved imports have already
+   *  sent a release to the peer and are handled locally. */
+  imports?: RpcSessionSnapshotImport[];
+};
+
+/**
+ * Everything needed to resume an RPC session after hibernation, stored in the
+ * WebSocket attachment via workerd's serializeAttachment API.
+ */
+export type HibernatableWebSocketAttachment = {
+  sessionId: string;
+  version: 1;
+  /** Full RPC session snapshot, persisted per-connection. */
+  snapshot?: RpcSessionSnapshot;
+};
+
+export interface HibernatableSessionStore {
+  load(sessionId: string): Promise<RpcSessionSnapshot | undefined>;
+  save(sessionId: string, snapshot: RpcSessionSnapshot): Promise<void>;
+  delete?(sessionId: string): Promise<void>;
+}
+
+export interface DurableObjectStorageLike {
+  get(key: string): Promise<unknown>;
+  put(key: string, value: unknown): Promise<void>;
+  delete?(key: string): Promise<unknown>;
+}
+
+export function __experimental_newDurableObjectSessionStore(
+    storage: DurableObjectStorageLike,
+    prefix: string = "capnweb:session:"): HibernatableSessionStore {
+  return {
+    async load(sessionId: string) {
+      const value = await storage.get(`${prefix}${sessionId}`);
+      return value as RpcSessionSnapshot | undefined;
+    },
+
+    async save(sessionId: string, snapshot: RpcSessionSnapshot) {
+      await storage.put(`${prefix}${sessionId}`, snapshot);
+    },
+
+    async delete(sessionId: string) {
+      await storage.delete?.(`${prefix}${sessionId}`);
+    },
+  };
+}

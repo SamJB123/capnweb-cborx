@@ -2,12 +2,21 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { RpcTarget as RpcTargetImpl, RpcStub as RpcStubImpl, RpcPromise as RpcPromiseImpl } from "./core.js";
+import {
+  RpcTarget as RpcTargetImpl,
+  RpcStub as RpcStubImpl,
+  RpcPromise as RpcPromiseImpl,
+  __experimental_debugRpcReference as __experimental_debugRpcReferenceImpl,
+} from "./core.js";
 import { serialize, deserialize } from "./serialize.js";
 import { RpcTransport, RpcSession as RpcSessionImpl, RpcSessionOptions } from "./rpc.js";
 import { RpcTargetBranded, RpcCompatible, Stub, Stubify, __RPC_TARGET_BRAND } from "./types.js";
 import { newWebSocketRpcSession as newWebSocketRpcSessionImpl,
-         newWorkersWebSocketRpcResponse } from "./websocket.js";
+         newWorkersWebSocketRpcResponse,
+         __experimental_newHibernatableWebSocketRpcSession as __experimental_newHibernatableWebSocketRpcSessionImpl,
+         __experimental_resumeHibernatableWebSocketRpcSession as __experimental_resumeHibernatableWebSocketRpcSessionImpl,
+         type HibernatableWebSocketOptions,
+         type HibernatableWebSocketSession } from "./websocket.js";
 import { newHttpBatchRpcSession as newHttpBatchRpcSessionImpl,
          newHttpBatchRpcResponse, nodeHttpBatchRpcResponse } from "./batch.js";
 import { newMessagePortRpcSession as newMessagePortRpcSessionImpl } from "./messageport.js";
@@ -20,7 +29,18 @@ forceInitStreams();
 // Re-export public API types.
 export { serialize, deserialize, newWorkersWebSocketRpcResponse, newHttpBatchRpcResponse,
          nodeHttpBatchRpcResponse };
+export { __experimental_newDurableObjectSessionStore } from "./hibernation.js";
 export type { RpcTransport, RpcSessionOptions, RpcCompatible };
+export type {
+  HibernatableCapabilityDescriptor,
+  HibernatableRpcTargetRegistry,
+  HibernatableSessionStore,
+  HibernatableWebSocketAttachment,
+  RpcSessionSnapshot,
+  RpcSessionSnapshotImport,
+  RpcSessionSnapshotExport,
+} from "./hibernation.js";
+export type { HibernatableWebSocketOptions, HibernatableWebSocketSession };
 
 // Hack the type system to make RpcStub's types work nicely!
 /**
@@ -131,6 +151,18 @@ export let newHttpBatchRpcSession:<T extends RpcCompatible<T>>
 export let newMessagePortRpcSession:<T extends RpcCompatible<T> = Empty>
     (port: MessagePort, localMain?: any, options?: RpcSessionOptions) => RpcStub<T> =
     <any>newMessagePortRpcSessionImpl;
+
+export let __experimental_newHibernatableWebSocketRpcSession:<T extends RpcCompatible<T> = Empty>
+    (webSocket: WebSocket, localMain: any, options: HibernatableWebSocketOptions) => Promise<HibernatableWebSocketSession> =
+    <any>__experimental_newHibernatableWebSocketRpcSessionImpl;
+
+export let __experimental_resumeHibernatableWebSocketRpcSession:<T extends RpcCompatible<T> = Empty>
+    (webSocket: WebSocket, localMain: any, options: HibernatableWebSocketOptions) => Promise<HibernatableWebSocketSession> =
+    <any>__experimental_resumeHibernatableWebSocketRpcSessionImpl;
+
+export const __experimental_debugRpcReference:
+    (value: unknown) => Record<string, unknown> =
+    <any>__experimental_debugRpcReferenceImpl;
 
 /**
  * Implements unified handling of HTTP-batch and WebSocket responses for the Cloudflare Workers

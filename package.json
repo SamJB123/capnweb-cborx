@@ -30,6 +30,7 @@
     "build": "tsup",
     "build:watch": "tsup --watch",
     "test": "vitest run",
+    "test:hibernation": "npm --prefix ./hibernation-tests test",
     "test:watch": "vitest",
     "test:types": "tsc -p __type-tests__/tsconfig.json --noEmit",
     "prepublishOnly": "npm run build"

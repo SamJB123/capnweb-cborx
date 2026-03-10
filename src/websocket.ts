@@ -6,6 +6,14 @@
 
 import { RpcStub } from "./core.js";
 import { RpcTransport, RpcSession, RpcSessionOptions } from "./rpc.js";
+import type { RpcTraceEvent } from "./rpc.js";
+import type {
+  HibernatableSessionStore,
+  HibernatableRpcTargetRegistry,
+  HibernatableWebSocketAttachment,
+  RpcSessionSnapshot,
+} from "./hibernation.js";
+import type { RpcSessionDebugState } from "./rpc.js";
 
 export function newWebSocketRpcSession(
     webSocket: WebSocket | string, localMain?: any, options?: RpcSessionOptions): RpcStub {
@@ -36,6 +44,150 @@ export function newWorkersWebSocketRpcResponse(
     status: 101,
     webSocket: pair[1],
   });
+}
+
+export type HibernatableWebSocketOptions = RpcSessionOptions & {
+  /** Optional session store for persisting snapshots to durable storage as a
+   *  backup. The primary persistence mechanism is the WebSocket attachment. */
+  sessionStore?: HibernatableSessionStore;
+  hibernationRegistry: HibernatableRpcTargetRegistry;
+  sessionId?: string;
+  __experimental_trace?: (event: RpcTraceEvent | HibernatableTransportTraceEvent) => void;
+};
+
+export interface HibernatableWebSocketSession {
+  sessionId: string;
+  getRemoteMain(): RpcStub;
+  getStats(): {imports: number, exports: number};
+  __experimental_snapshot(): RpcSessionSnapshot;
+  __experimental_debugState(): RpcSessionDebugState;
+  handleMessage(message: string | ArrayBuffer): void;
+  handleClose(code?: number, reason?: string, wasClean?: boolean): void;
+  handleError(error: any): void;
+}
+
+type HibernatableWebSocket = WebSocket & {
+  serializeAttachment?(value: unknown): void;
+  deserializeAttachment?(): unknown;
+};
+
+export type HibernatableTransportTraceEvent = {
+  source: "transport";
+  phase: string;
+  detail?: Record<string, unknown>;
+};
+
+/**
+ * Cloudflare Durable Object-specific helper that restores an RPC session on top of a hibernating
+ * WebSocket accepted via `DurableObjectState.acceptWebSocket()`.
+ *
+ * This is intentionally not a general-purpose WebSocket API. It relies on workerd's
+ * `serializeAttachment()` / `deserializeAttachment()` behavior and the Durable Object
+ * `webSocketMessage()` / `webSocketClose()` / `webSocketError()` event delivery model.
+ */
+export async function __experimental_newHibernatableWebSocketRpcSession(
+    webSocket: HibernatableWebSocket,
+    localMain: any,
+    options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession> {
+
+  let attachment = getAttachment(webSocket);
+  const sessionId = options.sessionId ?? attachment?.sessionId ?? makeSessionId();
+  const trace = (event: RpcTraceEvent | HibernatableTransportTraceEvent) => {
+    try {
+      options.__experimental_trace?.(event);
+    } catch (_err) {
+      // Ignore trace hook failures.
+    }
+  };
+
+  let snapshot = attachment?.snapshot
+      ?? (options.sessionStore ? await options.sessionStore.load(sessionId) : undefined);
+
+  let rpc!: RpcSession;
+  let persistScheduled = false;
+  let transport = new HibernatableWebSocketTransport(webSocket, () => {
+    if (!persistScheduled) {
+      persistScheduled = true;
+      queueMicrotask(() => {
+        persistScheduled = false;
+        void persistSnapshot();
+      });
+    }
+  }, trace);
+
+  rpc = new RpcSession(transport, localMain, {
+    ...options,
+    __experimental_hibernationRegistry: options.hibernationRegistry,
+    __experimental_restoreSnapshot: snapshot,
+    __experimental_trace: (event) => trace(event),
+  });
+
+  await persistSnapshot();
+
+  return {
+    sessionId,
+    getRemoteMain() {
+      return rpc.getRemoteMain();
+    },
+    getStats() {
+      return rpc.getStats();
+    },
+    __experimental_snapshot() {
+      return rpc.__experimental_snapshot();
+    },
+    __experimental_debugState() {
+      return rpc.__experimental_debugState();
+    },
+    handleMessage(message: string | ArrayBuffer) {
+      transport.pushIncoming(message);
+    },
+    handleClose(code?: number, reason?: string, wasClean?: boolean) {
+      transport.notifyClosed(code, reason, wasClean);
+    },
+    handleError(error: any) {
+      transport.notifyError(error);
+    },
+  };
+
+  async function persistSnapshot() {
+    try {
+      let snap = rpc.__experimental_snapshot();
+      webSocket.serializeAttachment?.({
+        sessionId,
+        version: 1 satisfies 1,
+        snapshot: snap,
+      } satisfies HibernatableWebSocketAttachment);
+      if (options.sessionStore) {
+        await options.sessionStore.save(sessionId, snap);
+      }
+    } catch (err) {
+      transport.abort?.(err);
+    }
+  }
+}
+
+export async function __experimental_resumeHibernatableWebSocketRpcSession(
+    webSocket: HibernatableWebSocket,
+    localMain: any,
+    options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession> {
+  return __experimental_newHibernatableWebSocketRpcSession(webSocket, localMain, options);
+}
+
+function getAttachment(webSocket: HibernatableWebSocket): HibernatableWebSocketAttachment | undefined {
+  let attachment = webSocket.deserializeAttachment?.() as HibernatableWebSocketAttachment | null | undefined;
+  if (attachment?.version === 1 && typeof attachment.sessionId === "string") {
+    return attachment;
+  }
+
+  return undefined;
+}
+
+function makeSessionId(): string {
+  if ("crypto" in globalThis && typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return `capnweb-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
 class WebSocketTransport implements RpcTransport {
@@ -126,6 +278,149 @@ class WebSocketTransport implements RpcTransport {
   }
 
   #receivedError(reason: any) {
+    if (!this.#error) {
+      this.#error = reason;
+      if (this.#receiveRejecter) {
+        this.#receiveRejecter(reason);
+        this.#receiveResolver = undefined;
+        this.#receiveRejecter = undefined;
+      }
+    }
+  }
+}
+
+class HibernatableWebSocketTransport implements RpcTransport {
+  constructor(
+      private webSocket: WebSocket,
+      private onActivity?: () => void,
+      private trace?: (event: HibernatableTransportTraceEvent) => void) {}
+
+  #sendQueue?: string[];
+  #receiveResolver?: (message: string) => void;
+  #receiveRejecter?: (err: any) => void;
+  #receiveQueue: string[] = [];
+  #error?: any;
+
+  async send(message: string): Promise<void> {
+    if (this.#error) throw this.#error;
+
+    this.trace?.({
+      source: "transport",
+      phase: "send.attempt",
+      detail: {
+        readyState: this.webSocket.readyState,
+        byteLength: message.length,
+      },
+    });
+
+    if (this.webSocket.readyState === WebSocket.CONNECTING) {
+      if (!this.#sendQueue) this.#sendQueue = [];
+      this.#sendQueue.push(message);
+      this.trace?.({
+        source: "transport",
+        phase: "send.queued",
+        detail: { queuedCount: this.#sendQueue.length },
+      });
+      return;
+    }
+
+    if (this.#sendQueue && this.#sendQueue.length > 0) {
+      for (let queued of this.#sendQueue) {
+        this.webSocket.send(queued);
+      }
+      this.trace?.({
+        source: "transport",
+        phase: "send.flushQueue",
+        detail: { queuedCount: this.#sendQueue.length },
+      });
+      this.#sendQueue = undefined;
+    }
+
+    this.webSocket.send(message);
+    this.trace?.({
+      source: "transport",
+      phase: "send.sent",
+      detail: { readyState: this.webSocket.readyState, byteLength: message.length },
+    });
+    this.onActivity?.();
+  }
+
+  async receive(): Promise<string> {
+    if (this.#receiveQueue.length > 0) {
+      return this.#receiveQueue.shift()!;
+    } else if (this.#error) {
+      throw this.#error;
+    } else {
+      return new Promise<string>((resolve, reject) => {
+        this.#receiveResolver = resolve;
+        this.#receiveRejecter = reject;
+      });
+    }
+  }
+
+  abort?(reason: any): void {
+    let message: string;
+    if (reason instanceof Error) {
+      message = reason.message;
+    } else {
+      message = `${reason}`;
+    }
+
+    try {
+      this.webSocket.close(3000, message);
+    } catch (err) {
+      // Ignore close failures, but still record the session error below.
+    }
+
+    this.#setError(reason);
+  }
+
+  pushIncoming(message: string | ArrayBuffer): void {
+    if (this.#error) return;
+
+    this.trace?.({
+      source: "transport",
+      phase: "receive.incoming",
+      detail: {
+        messageType: typeof message,
+        byteLength: typeof message === "string" ? message.length : message.byteLength,
+      },
+    });
+
+    if (typeof message !== "string") {
+      this.#setError(new TypeError("Received non-string message from hibernatable WebSocket."));
+      return;
+    }
+
+    if (this.#receiveResolver) {
+      this.#receiveResolver(message);
+      this.#receiveResolver = undefined;
+      this.#receiveRejecter = undefined;
+    } else {
+      this.#receiveQueue.push(message);
+    }
+    this.onActivity?.();
+  }
+
+  notifyClosed(code?: number, reason?: string, wasClean?: boolean): void {
+    this.trace?.({
+      source: "transport",
+      phase: "socket.closed",
+      detail: { code: code ?? null, reason: reason ?? null, wasClean: wasClean ?? null },
+    });
+    this.#setError(new Error(`Peer closed WebSocket: ${code ?? 1005} ${reason ?? ""}`.trim()));
+  }
+
+  notifyError(error: any): void {
+    this.trace?.({
+      source: "transport",
+      phase: "socket.error",
+      detail: { error: error instanceof Error ? error.message : String(error) },
+    });
+    this.#setError(error instanceof Error ? error : new Error(`${error}`));
+  }
+
+  #setError(reason: any) {
     if (!this.#error) {
       this.#error = reason;
       if (this.#receiveRejecter) {
