@@ -14,7 +14,12 @@ export type MapInstruction =
     | ["pipeline", number, PropertyPath, unknown]
     | ["remap", number, PropertyPath, ["import", number][], MapInstruction[]]
 
-class MapBuilder implements Exporter {
+export type RecordedMapProgram = {
+  captures: ["import", number][];
+  instructions: unknown[];
+};
+
+export class MapBuilder implements Exporter {
   private context:
     | {parent: undefined, captures: StubHook[], subject: StubHook, path: PropertyPath}
     | {parent: MapBuilder, captures: number[], subject: number, path: PropertyPath};
@@ -117,7 +122,7 @@ class MapBuilder implements Exporter {
   // ---------------------------------------------------------------------------
   // implements Exporter
 
-  exportStub(hook: StubHook): ExportId {
+  exportStub(hook: StubHook, _path?: PropertyPath): ExportId {
     // It appears someone did something like:
     //
     //     stub.map(x => { return x.doSomething(new MyRpcTarget()); })
@@ -134,7 +139,7 @@ class MapBuilder implements Exporter {
         "Can't construct an RpcTarget or RPC callback inside a mapper function. Try creating a " +
         "new RpcStub outside the callback first, then using it inside the callback.");
   }
-  exportPromise(hook: StubHook): ExportId {
+  exportPromise(hook: StubHook, _path?: PropertyPath): ExportId {
     return this.exportStub(hook);
   }
   getImport(hook: StubHook): ImportId | undefined {
@@ -185,7 +190,7 @@ function throwMapperBuilderUseError(): never {
 }
 
 // StubHook which represents a variable in a map function.
-class MapVariableHook extends StubHook {
+export class MapVariableHook extends StubHook {
   constructor(public mapper: MapBuilder, public idx: number) {
     super();
   }
@@ -229,6 +234,25 @@ class MapVariableHook extends StubHook {
 
   onBroken(callback: (error: any) => void): void {
     throwMapperBuilderUseError();
+  }
+}
+
+export function __experimental_recordInputPath(path: PropertyPath): RecordedMapProgram {
+  let builder = new MapBuilder(new ErrorStubHook(new Error("map-recorder-subject")), []);
+  let result: RpcPayload;
+  try {
+    let hook = builder.makeInput().get(path);
+    result = RpcPayload.fromAppReturn(new RpcPromise(hook, []));
+    let devalued = Devaluator.devaluate(result.value, undefined, builder, result);
+    // The result is the final instruction, same as makeOutput() does internally.
+    builder.instructions.push(<any>devalued);
+    return {
+      captures: [],
+      instructions: [...builder.instructions],
+    };
+  } finally {
+    builder.unregister();
+    result?.dispose();
   }
 }
 

@@ -12,14 +12,13 @@ import {
   RpcTarget,
   unwrapStubAndPath,
   streamImpl,
-  __experimental_describeStubHookForHibernation,
+  mapImpl,
   __experimental_debugStubHookIdentity,
-  __experimental_restoreStubHookFromHibernation,
 } from "./core.js";
 import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize } from "./serialize.js";
+import { __experimental_recordInputPath } from "./map.js";
 import type {
-  HibernatableCapabilityDescriptor,
-  HibernatableRpcTargetRegistry,
+  RpcSessionExportProvenance,
   RpcSessionSnapshot,
 } from "./hibernation.js";
 
@@ -57,7 +56,7 @@ export interface RpcTransport {
 type ExportTableEntry = {
   hook?: StubHook,
   refcount: number,
-  descriptor?: HibernatableCapabilityDescriptor,
+  provenance?: RpcSessionExportProvenance,
   pull?: Promise<void>,
 
   // If true, the export should be automatically released (with refcount 1) after its "resolve"
@@ -356,11 +355,6 @@ export type RpcSessionOptions = {
   onSendError?: (error: Error) => Error | void;
 
   /**
-   * EXPERIMENTAL: Registry used to describe and rebind exported RpcTargets across hibernation.
-   */
-  __experimental_hibernationRegistry?: HibernatableRpcTargetRegistry;
-
-  /**
    * EXPERIMENTAL: Restore a session from a previously-captured snapshot.
    */
   __experimental_restoreSnapshot?: RpcSessionSnapshot;
@@ -381,14 +375,13 @@ export type RpcSessionDebugState = {
   nextExportId: number;
   abortReason: string | null;
   pullCount: number;
-  registryBackedExportRestoreCount: number;
   exports: Array<{
     id: number;
     refcount: number;
     hasHook: boolean;
     hookType: string | null;
     hookIdentity: Record<string, unknown> | null;
-    descriptor: HibernatableCapabilityDescriptor | null;
+    provenance: RpcSessionExportProvenance | null;
     hasPull: boolean;
     autoRelease: boolean;
     hasPipeReadable: boolean;
@@ -420,12 +413,11 @@ class RpcSessionImpl implements Importer, Exporter {
 
   // How many promises is our peer expecting us to resolve?
   private pullCount = 0;
+  private currentNegativeExportProvenanceExpr?: unknown;
 
   // Sparse array of onBrokenCallback registrations. Items are strictly appended to the end but
   // may be deleted from the middle (hence leaving the array sparse).
   onBrokenCallbacks: ((error: any) => void)[] = [];
-  private registryBackedExportRestoreCount = 0;
-
   constructor(private transport: RpcTransport, mainHook: StubHook,
       private options: RpcSessionOptions) {
     // Export zero is automatically the bootstrap object.
@@ -469,7 +461,7 @@ class RpcSessionImpl implements Importer, Exporter {
     this.abort(new Error("RPC session was shut down by disposing the main stub"), false);
   }
 
-  exportStub(hook: StubHook): ExportId {
+  exportStub(hook: StubHook, path?: PropertyPath): ExportId {
     if (this.abortReason) throw this.abortReason;
 
     let existingExportId = this.reverseExports.get(hook);
@@ -479,7 +471,20 @@ class RpcSessionImpl implements Importer, Exporter {
       return existingExportId;
     } else {
       let exportId = this.nextExportId--;
-      this.exports[exportId] = { hook, refcount: 1 };
+      this.exports[exportId] = {
+        hook,
+        refcount: 1,
+        ...(this.currentNegativeExportProvenanceExpr !== undefined ? {
+          provenance: (() => {
+            let mapProgram = __experimental_recordInputPath(path ?? []);
+            return {
+              expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+              captures: mapProgram.captures,
+              instructions: mapProgram.instructions,
+            };
+          })(),
+        } : {}),
+      };
       this.reverseExports.set(hook, exportId);
       this.trace("exportStub.new", { exportId, hookType: hook.constructor?.name ?? null });
       // TODO: Use onBroken().
@@ -487,12 +492,25 @@ class RpcSessionImpl implements Importer, Exporter {
     }
   }
 
-  exportPromise(hook: StubHook): ExportId {
+  exportPromise(hook: StubHook, path?: PropertyPath): ExportId {
     if (this.abortReason) throw this.abortReason;
 
     // Promises always use a new ID because otherwise the recipient could miss the resolution.
     let exportId = this.nextExportId--;
-    this.exports[exportId] = { hook, refcount: 1 };
+    this.exports[exportId] = {
+      hook,
+      refcount: 1,
+      ...(this.currentNegativeExportProvenanceExpr !== undefined ? {
+        provenance: (() => {
+          let mapProgram = __experimental_recordInputPath(path ?? []);
+          return {
+            expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+            captures: mapProgram.captures,
+            instructions: mapProgram.instructions,
+          };
+        })(),
+      } : {}),
+    };
     this.reverseExports.set(hook, exportId);
     this.trace("exportPromise.new", { exportId, hookType: hook.constructor?.name ?? null });
 
@@ -557,7 +575,7 @@ class RpcSessionImpl implements Importer, Exporter {
       this.trace("ensureResolvingExport.start", {
         exportId,
         hasHook: !!exp.hook,
-        descriptorKind: exp.descriptor?.kind ?? null,
+        hasProvenance: !!exp.provenance,
       });
       let resolve = async () => {
         let hook = this.getOrRestoreExportHook(exportId);
@@ -592,9 +610,16 @@ class RpcSessionImpl implements Importer, Exporter {
       ++this.pullCount;
       exp.pull = resolve().then(
         payload => {
+          const previousExpr = this.currentNegativeExportProvenanceExpr;
+          this.currentNegativeExportProvenanceExpr = exp.provenance?.expr;
           // We don't transfer ownership of stubs in the payload since the payload
           // belongs to the hook which sticks around to handle pipelined requests.
-          let value = Devaluator.devaluate(payload.value, undefined, this, payload);
+          let value: unknown;
+          try {
+            value = Devaluator.devaluate(payload.value, undefined, this, payload);
+          } finally {
+            this.currentNegativeExportProvenanceExpr = previousExpr;
+          }
           this.trace("ensureResolvingExport.resolve", { exportId, valueType: typeof payload.value });
           this.send(["resolve", exportId, value]);
           if (autoRelease) this.releaseExport(exportId, 1);
@@ -674,11 +699,6 @@ class RpcSessionImpl implements Importer, Exporter {
   }
 
   __experimental_snapshot(): RpcSessionSnapshot {
-    let registry = this.options.__experimental_hibernationRegistry;
-    if (!registry) {
-      throw new Error("Can't snapshot RPC session without a hibernation registry.");
-    }
-
     const imports = [] as NonNullable<RpcSessionSnapshot["imports"]>;
     for (let i in this.imports) {
       let id = Number(i);
@@ -702,31 +722,23 @@ class RpcSessionImpl implements Importer, Exporter {
       let entry = this.exports[i];
       if (!entry) continue;
 
-      let descriptor = entry.descriptor;
-      if (!descriptor && entry.hook) {
-        descriptor = __experimental_describeStubHookForHibernation(entry.hook, registry);
-        if (descriptor) {
-          entry.descriptor = descriptor;
-        }
-      }
-
-      if (!descriptor) {
+      if (!entry.provenance) {
         console.error(
             `[capnweb] Export ${id} is not hibernatable (hook type: ${entry.hook?.constructor?.name ?? "none"}). ` +
-            `It will be lost on hibernation. Register it in the hibernation registry to fix this.`);
+            `It will be lost on hibernation. It needs intrinsic provenance.`);
         continue;
       }
 
       exports.push({
         id,
         refcount: entry.refcount,
-        descriptor,
+        provenance: entry.provenance,
         ...(entry.pull ? {pulling: true} : {}),
       });
     }
 
     return {
-      version: 1,
+      version: 2,
       nextExportId: this.nextExportId,
       exports,
       ...(imports.length > 0 ? {imports} : {}),
@@ -871,11 +883,9 @@ class RpcSessionImpl implements Importer, Exporter {
     });
 
     let value = ["remap", id, path, devaluedCaptures, instructions];
-
-    this.send(["push", value]);
-
     let entry = new ImportTableEntry(this, this.imports.length, false);
     this.imports.push(entry);
+    this.send(["push", entry.importId, value]);
     this.trace("sendMap", { importId: entry.importId, targetImportId: id, pathLength: path.length, captureCount: captures.length });
     return new RpcImportHook(/*isPromise=*/true, entry);
   }
@@ -975,7 +985,11 @@ class RpcSessionImpl implements Importer, Exporter {
               // treated as an unhandled rejection on our end.
               hook.ignoreUnhandledRejections();
 
-              this.replacePositiveExport(exportId, { hook, refcount: 1 });
+              this.replacePositiveExport(exportId, {
+                hook,
+                refcount: 1,
+                provenance: { expr: structuredClone(msg[2]) },
+              });
               this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
             }
@@ -992,7 +1006,12 @@ class RpcSessionImpl implements Importer, Exporter {
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
 
-              this.replacePositiveExport(exportId, { hook, refcount: 1, autoRelease: true });
+              this.replacePositiveExport(exportId, {
+                hook,
+                refcount: 1,
+                autoRelease: true,
+                provenance: { expr: structuredClone(msg[2]) },
+              });
               this.trace("readLoop.stream", { exportId, hookType: hook.constructor?.name ?? null });
 
               // Automatically pull since stream messages are always pulled.
@@ -1119,7 +1138,7 @@ class RpcSessionImpl implements Importer, Exporter {
         hasHook: !!entry.hook,
         hookType: entry.hook?.constructor?.name ?? null,
         hookIdentity: entry.hook ? __experimental_debugStubHookIdentity(entry.hook) : null,
-        descriptor: entry.descriptor ?? null,
+        provenance: entry.provenance ?? null,
         hasPull: !!entry.pull,
         autoRelease: !!entry.autoRelease,
         hasPipeReadable: !!entry.pipeReadable,
@@ -1137,7 +1156,6 @@ class RpcSessionImpl implements Importer, Exporter {
       nextExportId: this.nextExportId,
       abortReason: this.abortReason ? String(this.abortReason) : null,
       pullCount: this.pullCount,
-      registryBackedExportRestoreCount: this.registryBackedExportRestoreCount,
       exports,
       imports,
     };
@@ -1150,26 +1168,68 @@ class RpcSessionImpl implements Importer, Exporter {
     }
 
     if (!entry.hook) {
-      const registry = this.options.__experimental_hibernationRegistry;
-      if (!registry || !entry.descriptor) {
-        throw new Error(`Export ${exportId} can't be restored after hibernation.`);
-      }
+      if (entry.provenance) {
+        let payload = new Evaluator(this).evaluate(structuredClone(entry.provenance.expr));
+        let hook: StubHook;
+        if (entry.provenance.instructions) {
+          const captures = (entry.provenance.captures ?? []).map(captureExpr => {
+            const capturePayload = new Evaluator(this).evaluate(structuredClone(captureExpr));
+            const captureValue = capturePayload.value;
+            if (!(captureValue instanceof RpcStub)) {
+              capturePayload.dispose();
+              throw new Error("Map provenance capture did not evaluate to an RpcStub.");
+            }
 
-      entry.hook = __experimental_restoreStubHookFromHibernation(entry.descriptor, registry);
-      this.registryBackedExportRestoreCount += 1;
-      this.reverseExports.set(entry.hook, exportId);
-      this.trace("getOrRestoreExportHook.restore", {
-        exportId,
-        descriptorKind: entry.descriptor.kind,
-        hookType: entry.hook.constructor?.name ?? null,
-      });
+            const {hook: captureHook, pathIfPromise} = unwrapStubAndPath(captureValue);
+            capturePayload.dispose();
+
+            if (pathIfPromise && pathIfPromise.length > 0) {
+              return captureHook.get(pathIfPromise);
+            } else if (pathIfPromise) {
+              return captureHook.get([]);
+            } else {
+              return captureHook.dup();
+            }
+          });
+
+          if (payload.value instanceof RpcStub) {
+            const {hook: provenanceHook, pathIfPromise} = unwrapStubAndPath(payload.value);
+            hook = provenanceHook.map(pathIfPromise ?? [], captures, structuredClone(entry.provenance.instructions));
+            payload.dispose();
+          } else {
+            hook = mapImpl.applyMap(
+                payload.value,
+                undefined,
+                payload,
+                captures,
+                structuredClone(entry.provenance.instructions));
+          }
+        } else {
+          hook = new PayloadStubHook(payload);
+          if (entry.provenance.path && entry.provenance.path.length > 0) {
+            let derived = hook.get(entry.provenance.path);
+            hook.dispose();
+            hook = derived;
+          }
+        }
+        entry.hook = hook;
+        this.reverseExports.set(entry.hook, exportId);
+        this.trace("getOrRestoreExportHook.replay", {
+          exportId,
+          pathLength: entry.provenance.path?.length ?? 0,
+          instructionCount: entry.provenance.instructions?.length ?? 0,
+          hookType: entry.hook.constructor?.name ?? null,
+        });
+      } else {
+        throw new Error(`Export ${exportId} can't be restored after hibernation because it has no provenance.`);
+      }
     }
 
     return entry.hook;
   }
 
   private restoreFromSnapshot(snapshot: RpcSessionSnapshot) {
-    if (snapshot.version !== 1) {
+    if (snapshot.version !== 1 && snapshot.version !== 2) {
       throw new Error(`Unsupported RPC session snapshot version: ${snapshot.version}`);
     }
 
@@ -1184,12 +1244,12 @@ class RpcSessionImpl implements Importer, Exporter {
     for (let exp of snapshot.exports) {
       this.exports[exp.id] = {
         refcount: exp.refcount,
-        descriptor: exp.descriptor,
+        ...(exp.provenance ? { provenance: exp.provenance } : {}),
       };
       this.trace("restoreFromSnapshot.export", {
         exportId: exp.id,
         refcount: exp.refcount,
-        descriptorKind: exp.descriptor.kind,
+        hasProvenance: !!exp.provenance,
         pulling: !!exp.pulling,
       });
       if (exp.pulling) {

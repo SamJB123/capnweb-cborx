@@ -2,34 +2,19 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import type { RpcTarget } from "./core.js";
+import type { PropertyPath } from "./core.js";
 
-/**
- * Describes a capability that can be rebound after the hosting process wakes from hibernation.
- *
- * The library treats the contents as application-defined. A common pattern is to encode a Durable
- * Object namespace plus object ID.
- */
-export type HibernatableCapabilityDescriptor = {
-  kind: string;
-  [key: string]: unknown;
+export type RpcSessionExportProvenance = {
+  expr: unknown;
+  captures?: ["import", number][];
+  instructions?: unknown[];
+  path?: PropertyPath;
 };
-
-/**
- * Application-provided registry used to persist and rebind hibernatable exported capabilities.
- *
- * V1 support is intentionally narrow: only exported capabilities that can be described and later
- * recreated through this registry are resumable after hibernation.
- */
-export interface HibernatableRpcTargetRegistry {
-  describe(target: RpcTarget | Function): HibernatableCapabilityDescriptor | undefined;
-  restore(descriptor: HibernatableCapabilityDescriptor): RpcTarget | Function;
-}
 
 export type RpcSessionSnapshotExport = {
   id: number;
   refcount: number;
-  descriptor: HibernatableCapabilityDescriptor;
+  provenance?: RpcSessionExportProvenance;
   /** If true, this export had an in-flight pull at snapshot time.
    *  On restore the pull will be re-triggered automatically so the
    *  client receives the resolve/reject it is still waiting for. */
@@ -50,7 +35,7 @@ export type RpcSessionSnapshotImport = {
 };
 
 export type RpcSessionSnapshot = {
-  version: 1;
+  version: 1 | 2;
   nextExportId: number;
   exports: RpcSessionSnapshotExport[];
   /** Peer-imported capabilities (stubs pointing back to the peer's exports).

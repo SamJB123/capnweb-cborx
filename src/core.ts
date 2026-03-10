@@ -5,8 +5,6 @@
 import type { RpcTargetBranded, __RPC_TARGET_BRAND } from "./types.js";
 import { WORKERS_MODULE_SYMBOL } from "./symbols.js"
 import type {
-  HibernatableCapabilityDescriptor,
-  HibernatableRpcTargetRegistry,
 } from "./hibernation.js";
 
 // Polyfill Symbol.dispose for browsers that don't support it yet
@@ -49,6 +47,95 @@ function getDebugObjectId(value: unknown): number | null {
   let next = DEBUG_OBJECT_ID_SEQ++;
   DEBUG_OBJECT_IDS.set(value as object, next);
   return next;
+}
+
+function debugSerializeUnknown(value: unknown, depth: number = 0): unknown {
+  if (depth > 2) {
+    return {
+      kind: typeof value,
+      objectId: getDebugObjectId(value),
+      truncated: true,
+    };
+  }
+
+  if (
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "number" ||
+      typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "undefined") {
+    return { kind: "undefined" };
+  }
+
+  if (typeof value === "bigint") {
+    return { kind: "bigint", value: value.toString() };
+  }
+
+  if (typeof value === "symbol") {
+    return { kind: "symbol", value: String(value) };
+  }
+
+  if (typeof value === "function") {
+    return {
+      kind: "function",
+      objectId: getDebugObjectId(value),
+      name: value.name || null,
+      constructorName: value.constructor?.name ?? null,
+    };
+  }
+
+  if (value instanceof Date) {
+    return {
+      kind: "date",
+      value: value.toISOString(),
+    };
+  }
+
+  if (value instanceof Uint8Array) {
+    return {
+      kind: "Uint8Array",
+      objectId: getDebugObjectId(value),
+      byteLength: value.byteLength,
+    };
+  }
+
+  if (Array.isArray(value)) {
+    return {
+      kind: "array",
+      objectId: getDebugObjectId(value),
+      length: value.length,
+      items: value.slice(0, 10).map(item => debugSerializeUnknown(item, depth + 1)),
+    };
+  }
+
+  if (typeof value === "object") {
+    let obj = value as Record<string, unknown>;
+    let props: Record<string, unknown> = {};
+    for (let key of Object.getOwnPropertyNames(obj)) {
+      try {
+        props[key] = debugSerializeUnknown(obj[key], depth + 1);
+      } catch (err) {
+        props[key] = {
+          kind: "unreadable",
+          error: err instanceof Error ? err.message : String(err),
+        };
+      }
+    }
+    return {
+      kind: "object",
+      objectId: getDebugObjectId(obj),
+      constructorName: obj.constructor?.name ?? null,
+      props,
+    };
+  }
+
+  return {
+    kind: typeof value,
+    value: String(value),
+  };
 }
 
 export interface RpcTarget {
@@ -1909,15 +1996,6 @@ class TargetStubHook extends ValueStubHook {
     // TODO: Should RpcTargets be able to implement onRpcBroken?
   }
 
-  describeForHibernation(
-      registry: HibernatableRpcTargetRegistry): HibernatableCapabilityDescriptor | undefined {
-    if (this.target) {
-      return registry.describe(this.target);
-    }
-
-    return undefined;
-  }
-
   __experimental_debugIdentity() {
     return {
       hookObjectId: getDebugObjectId(this),
@@ -1927,24 +2005,13 @@ class TargetStubHook extends ValueStubHook {
       hasRefcount: !!this.refcount,
       refcountObjectId: getDebugObjectId(this.refcount),
       refcountValue: this.refcount?.count ?? null,
+      rawThis: debugSerializeUnknown({
+        target: this.target,
+        parent: this.parent,
+        refcount: this.refcount,
+      }),
     };
   }
-}
-
-export function __experimental_describeStubHookForHibernation(
-    hook: StubHook,
-    registry: HibernatableRpcTargetRegistry): HibernatableCapabilityDescriptor | undefined {
-  if (hook instanceof TargetStubHook) {
-    return hook.describeForHibernation(registry);
-  }
-
-  return undefined;
-}
-
-export function __experimental_restoreStubHookFromHibernation(
-    descriptor: HibernatableCapabilityDescriptor,
-    registry: HibernatableRpcTargetRegistry): StubHook {
-  return TargetStubHook.create(registry.restore(descriptor), undefined);
 }
 
 export function __experimental_debugStubHookIdentity(hook: StubHook): Record<string, unknown> {

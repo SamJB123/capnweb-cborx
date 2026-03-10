@@ -9,7 +9,6 @@ import { RpcTransport, RpcSession, RpcSessionOptions } from "./rpc.js";
 import type { RpcTraceEvent } from "./rpc.js";
 import type {
   HibernatableSessionStore,
-  HibernatableRpcTargetRegistry,
   HibernatableWebSocketAttachment,
   RpcSessionSnapshot,
 } from "./hibernation.js";
@@ -50,7 +49,6 @@ export type HibernatableWebSocketOptions = RpcSessionOptions & {
   /** Optional session store for persisting snapshots to durable storage as a
    *  backup. The primary persistence mechanism is the WebSocket attachment. */
   sessionStore?: HibernatableSessionStore;
-  hibernationRegistry: HibernatableRpcTargetRegistry;
   sessionId?: string;
   __experimental_trace?: (event: RpcTraceEvent | HibernatableTransportTraceEvent) => void;
 };
@@ -117,7 +115,6 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
 
   rpc = new RpcSession(transport, localMain, {
     ...options,
-    __experimental_hibernationRegistry: options.hibernationRegistry,
     __experimental_restoreSnapshot: snapshot,
     __experimental_trace: (event) => trace(event),
   });

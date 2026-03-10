@@ -1,3 +1,4 @@
+import * as cfw from "cloudflare:workers";
 import { DurableObject } from "cloudflare:workers";
 // @__NO_SIDE_EFFECTS__
 function createNotImplementedError(name) {
@@ -227,6 +228,7 @@ globalThis.PerformanceObserver = PerformanceObserver;
 globalThis.PerformanceObserverEntryList = PerformanceObserverEntryList;
 globalThis.PerformanceResourceTiming = PerformanceResourceTiming;
 let WORKERS_MODULE_SYMBOL = /* @__PURE__ */ Symbol("workers-module");
+globalThis[WORKERS_MODULE_SYMBOL] = cfw;
 if (!Symbol.dispose) {
   Symbol.dispose = /* @__PURE__ */ Symbol.for("dispose");
 }
@@ -258,6 +260,80 @@ function getDebugObjectId(value) {
   let next = DEBUG_OBJECT_ID_SEQ++;
   DEBUG_OBJECT_IDS.set(value, next);
   return next;
+}
+function debugSerializeUnknown(value, depth = 0) {
+  if (depth > 2) {
+    return {
+      kind: typeof value,
+      objectId: getDebugObjectId(value),
+      truncated: true
+    };
+  }
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "undefined") {
+    return { kind: "undefined" };
+  }
+  if (typeof value === "bigint") {
+    return { kind: "bigint", value: value.toString() };
+  }
+  if (typeof value === "symbol") {
+    return { kind: "symbol", value: String(value) };
+  }
+  if (typeof value === "function") {
+    return {
+      kind: "function",
+      objectId: getDebugObjectId(value),
+      name: value.name || null,
+      constructorName: value.constructor?.name ?? null
+    };
+  }
+  if (value instanceof Date) {
+    return {
+      kind: "date",
+      value: value.toISOString()
+    };
+  }
+  if (value instanceof Uint8Array) {
+    return {
+      kind: "Uint8Array",
+      objectId: getDebugObjectId(value),
+      byteLength: value.byteLength
+    };
+  }
+  if (Array.isArray(value)) {
+    return {
+      kind: "array",
+      objectId: getDebugObjectId(value),
+      length: value.length,
+      items: value.slice(0, 10).map((item) => debugSerializeUnknown(item, depth + 1))
+    };
+  }
+  if (typeof value === "object") {
+    let obj = value;
+    let props = {};
+    for (let key of Object.getOwnPropertyNames(obj)) {
+      try {
+        props[key] = debugSerializeUnknown(obj[key], depth + 1);
+      } catch (err) {
+        props[key] = {
+          kind: "unreadable",
+          error: err instanceof Error ? err.message : String(err)
+        };
+      }
+    }
+    return {
+      kind: "object",
+      objectId: getDebugObjectId(obj),
+      constructorName: obj.constructor?.name ?? null,
+      props
+    };
+  }
+  return {
+    kind: typeof value,
+    value: String(value)
+  };
 }
 let RpcTarget$1 = workersModule ? workersModule.RpcTarget : class {
 };
@@ -1430,12 +1506,6 @@ class TargetStubHook extends ValueStubHook {
   }
   onBroken(callback) {
   }
-  describeForHibernation(registry) {
-    if (this.target) {
-      return registry.describe(this.target);
-    }
-    return void 0;
-  }
   __experimental_debugIdentity() {
     return {
       hookObjectId: getDebugObjectId(this),
@@ -1444,18 +1514,14 @@ class TargetStubHook extends ValueStubHook {
       parentObjectId: getDebugObjectId(this.parent),
       hasRefcount: !!this.refcount,
       refcountObjectId: getDebugObjectId(this.refcount),
-      refcountValue: this.refcount?.count ?? null
+      refcountValue: this.refcount?.count ?? null,
+      rawThis: debugSerializeUnknown({
+        target: this.target,
+        parent: this.parent,
+        refcount: this.refcount
+      })
     };
   }
-}
-function __experimental_describeStubHookForHibernation(hook, registry) {
-  if (hook instanceof TargetStubHook) {
-    return hook.describeForHibernation(registry);
-  }
-  return void 0;
-}
-function __experimental_restoreStubHookFromHibernation(descriptor, registry) {
-  return TargetStubHook.create(registry.restore(descriptor), void 0);
 }
 function __experimental_debugStubHookIdentity(hook) {
   const customDebug = hook.__experimental_debugIdentity?.();
@@ -1599,7 +1665,7 @@ class Devaluator {
   static devaluate(value, parent, exporter = NULL_EXPORTER, source) {
     let devaluator = new Devaluator(exporter, source);
     try {
-      return devaluator.devaluateImpl(value, parent, 0);
+      return devaluator.devaluateImpl(value, parent, 0, []);
     } catch (err) {
       if (devaluator.exports) {
         try {
@@ -1611,7 +1677,7 @@ class Devaluator {
     }
   }
   exports;
-  devaluateImpl(value, parent, depth) {
+  devaluateImpl(value, parent, depth, path) {
     if (depth >= 64) {
       throw new Error(
         "Serialization exceeded maximum allowed depth. (Does the message contain cycles?)"
@@ -1644,7 +1710,7 @@ class Devaluator {
         let object = value;
         let result = {};
         for (let key in object) {
-          result[key] = this.devaluateImpl(object[key], object, depth + 1);
+          result[key] = this.devaluateImpl(object[key], object, depth + 1, path.concat(key));
         }
         return result;
       }
@@ -1653,7 +1719,7 @@ class Devaluator {
         let len = array.length;
         let result = new Array(len);
         for (let i = 0; i < len; i++) {
-          result[i] = this.devaluateImpl(array[i], array, depth + 1);
+          result[i] = this.devaluateImpl(array[i], array, depth + 1, path.concat(i));
         }
         return [result];
       }
@@ -1690,7 +1756,7 @@ class Devaluator {
           init.headers = headers;
         }
         if (req.body) {
-          init.body = this.devaluateImpl(req.body, req, depth + 1);
+          init.body = this.devaluateImpl(req.body, req, depth + 1, path.concat("body"));
           init.duplex = req.duplex || "half";
         } else if (req.body === void 0 && !["GET", "HEAD", "OPTIONS", "TRACE", "DELETE"].includes(req.method)) {
           let bodyPromise = req.arrayBuffer();
@@ -1728,7 +1794,7 @@ class Devaluator {
       }
       case "response": {
         let resp = value;
-        let body = this.devaluateImpl(resp.body, resp, depth + 1);
+        let body = this.devaluateImpl(resp.body, resp, depth + 1, path.concat("body"));
         let init = {};
         if (resp.status !== 200) init.status = resp.status;
         if (resp.statusText) init.statusText = resp.statusText;
@@ -1783,7 +1849,7 @@ class Devaluator {
         } else {
           hook = hook.dup();
         }
-        return this.devaluateHook(pathIfPromise ? "promise" : "export", hook);
+        return this.devaluateHook(pathIfPromise ? "promise" : "export", hook, path);
       }
       case "function":
       case "rpc-target": {
@@ -1791,21 +1857,21 @@ class Devaluator {
           throw new Error("Can't serialize RPC stubs in this context.");
         }
         let hook = this.source.getHookForRpcTarget(value, parent);
-        return this.devaluateHook("export", hook);
+        return this.devaluateHook("export", hook, path);
       }
       case "rpc-thenable": {
         if (!this.source) {
           throw new Error("Can't serialize RPC stubs in this context.");
         }
         let hook = this.source.getHookForRpcTarget(value, parent);
-        return this.devaluateHook("promise", hook);
+        return this.devaluateHook("promise", hook, path);
       }
       case "writable": {
         if (!this.source) {
           throw new Error("Can't serialize WritableStream in this context.");
         }
         let hook = this.source.getHookForWritableStream(value, parent);
-        return this.devaluateHook("writable", hook);
+        return this.devaluateHook("writable", hook, path);
       }
       case "readable": {
         if (!this.source) {
@@ -1820,9 +1886,9 @@ class Devaluator {
         throw new Error("unreachable");
     }
   }
-  devaluateHook(type, hook) {
+  devaluateHook(type, hook, path) {
     if (!this.exports) this.exports = [];
-    let exportId = type === "promise" ? this.exporter.exportPromise(hook) : this.exporter.exportStub(hook);
+    let exportId = type === "promise" ? this.exporter.exportPromise(hook, path) : this.exporter.exportStub(hook, path);
     this.exports.push(exportId);
     return [type, exportId];
   }
@@ -2102,6 +2168,274 @@ class Evaluator {
     }
   }
 }
+let currentMapBuilder;
+class MapBuilder {
+  context;
+  captureMap = /* @__PURE__ */ new Map();
+  instructions = [];
+  constructor(subject, path) {
+    if (currentMapBuilder) {
+      this.context = {
+        parent: currentMapBuilder,
+        captures: [],
+        subject: currentMapBuilder.capture(subject),
+        path
+      };
+    } else {
+      this.context = {
+        parent: void 0,
+        captures: [],
+        subject,
+        path
+      };
+    }
+    currentMapBuilder = this;
+  }
+  unregister() {
+    currentMapBuilder = this.context.parent;
+  }
+  makeInput() {
+    return new MapVariableHook(this, 0);
+  }
+  makeOutput(result) {
+    let devalued;
+    try {
+      devalued = Devaluator.devaluate(result.value, void 0, this, result);
+    } finally {
+      result.dispose();
+    }
+    this.instructions.push(devalued);
+    if (this.context.parent) {
+      this.context.parent.instructions.push(
+        [
+          "remap",
+          this.context.subject,
+          this.context.path,
+          this.context.captures.map((cap) => ["import", cap]),
+          this.instructions
+        ]
+      );
+      return new MapVariableHook(this.context.parent, this.context.parent.instructions.length);
+    } else {
+      return this.context.subject.map(this.context.path, this.context.captures, this.instructions);
+    }
+  }
+  pushCall(hook, path, params) {
+    let devalued = Devaluator.devaluate(params.value, void 0, this, params);
+    devalued = devalued[0];
+    let subject = this.capture(hook.dup());
+    this.instructions.push(["pipeline", subject, path, devalued]);
+    return new MapVariableHook(this, this.instructions.length);
+  }
+  pushGet(hook, path) {
+    let subject = this.capture(hook.dup());
+    this.instructions.push(["pipeline", subject, path]);
+    return new MapVariableHook(this, this.instructions.length);
+  }
+  capture(hook) {
+    if (hook instanceof MapVariableHook && hook.mapper === this) {
+      return hook.idx;
+    }
+    let result = this.captureMap.get(hook);
+    if (result === void 0) {
+      if (this.context.parent) {
+        let parentIdx = this.context.parent.capture(hook);
+        this.context.captures.push(parentIdx);
+      } else {
+        this.context.captures.push(hook);
+      }
+      result = -this.context.captures.length;
+      this.captureMap.set(hook, result);
+    }
+    return result;
+  }
+  // ---------------------------------------------------------------------------
+  // implements Exporter
+  exportStub(hook, _path) {
+    throw new Error(
+      "Can't construct an RpcTarget or RPC callback inside a mapper function. Try creating a new RpcStub outside the callback first, then using it inside the callback."
+    );
+  }
+  exportPromise(hook, _path) {
+    return this.exportStub(hook);
+  }
+  getImport(hook) {
+    return this.capture(hook);
+  }
+  unexport(ids) {
+  }
+  createPipe(readable) {
+    throw new Error("Cannot send ReadableStream inside a mapper function.");
+  }
+  onSendError(error) {
+  }
+}
+mapImpl.sendMap = (hook, path, func) => {
+  let builder = new MapBuilder(hook, path);
+  let result;
+  try {
+    result = RpcPayload.fromAppReturn(withCallInterceptor(builder.pushCall.bind(builder), () => {
+      return func(new RpcPromise(builder.makeInput(), []));
+    }));
+  } finally {
+    builder.unregister();
+  }
+  if (result instanceof Promise) {
+    result.catch((err) => {
+    });
+    throw new Error("RPC map() callbacks cannot be async.");
+  }
+  return new RpcPromise(builder.makeOutput(result), []);
+};
+function throwMapperBuilderUseError() {
+  throw new Error(
+    "Attempted to use an abstract placeholder from a mapper function. Please make sure your map function has no side effects."
+  );
+}
+class MapVariableHook extends StubHook {
+  constructor(mapper, idx) {
+    super();
+    this.mapper = mapper;
+    this.idx = idx;
+  }
+  // We don't have anything we actually need to dispose, so dup() can just return the same hook.
+  dup() {
+    return this;
+  }
+  dispose() {
+  }
+  get(path) {
+    if (path.length == 0) {
+      return this;
+    } else if (currentMapBuilder) {
+      return currentMapBuilder.pushGet(this, path);
+    } else {
+      throwMapperBuilderUseError();
+    }
+  }
+  // Other methods should never be called.
+  call(path, args) {
+    throwMapperBuilderUseError();
+  }
+  map(path, captures, instructions) {
+    throwMapperBuilderUseError();
+  }
+  pull() {
+    throwMapperBuilderUseError();
+  }
+  ignoreUnhandledRejections() {
+  }
+  onBroken(callback) {
+    throwMapperBuilderUseError();
+  }
+}
+function __experimental_recordInputPath(path) {
+  let builder = new MapBuilder(new ErrorStubHook(new Error("map-recorder-subject")), []);
+  let result;
+  try {
+    let hook = builder.makeInput().get(path);
+    result = RpcPayload.fromAppReturn(new RpcPromise(hook, []));
+    let devalued = Devaluator.devaluate(result.value, void 0, builder, result);
+    builder.instructions.push(devalued);
+    return {
+      captures: [],
+      instructions: [...builder.instructions]
+    };
+  } finally {
+    builder.unregister();
+    result?.dispose();
+  }
+}
+class MapApplicator {
+  constructor(captures, input) {
+    this.captures = captures;
+    this.variables = [input];
+  }
+  variables;
+  dispose() {
+    for (let variable of this.variables) {
+      variable.dispose();
+    }
+  }
+  apply(instructions) {
+    try {
+      if (instructions.length < 1) {
+        throw new Error("Invalid empty mapper function.");
+      }
+      for (let instruction of instructions.slice(0, -1)) {
+        let payload = new Evaluator(this).evaluateCopy(instruction);
+        if (payload.value instanceof RpcStub) {
+          let hook = unwrapStubNoProperties(payload.value);
+          if (hook) {
+            this.variables.push(hook);
+            continue;
+          }
+        }
+        this.variables.push(new PayloadStubHook(payload));
+      }
+      return new Evaluator(this).evaluateCopy(instructions[instructions.length - 1]);
+    } finally {
+      for (let variable of this.variables) {
+        variable.dispose();
+      }
+    }
+  }
+  importStub(idx) {
+    throw new Error("A mapper function cannot refer to exports.");
+  }
+  importPromise(idx) {
+    return this.importStub(idx);
+  }
+  getExport(idx) {
+    if (idx < 0) {
+      return this.captures[-idx - 1];
+    } else {
+      return this.variables[idx];
+    }
+  }
+  getPipeReadable(exportId) {
+    throw new Error("A mapper function cannot use pipe readables.");
+  }
+}
+function applyMapToElement(input, parent, owner, captures, instructions) {
+  let inputHook = new PayloadStubHook(RpcPayload.deepCopyFrom(input, parent, owner));
+  let mapper = new MapApplicator(captures, inputHook);
+  try {
+    return mapper.apply(instructions);
+  } finally {
+    mapper.dispose();
+  }
+}
+mapImpl.applyMap = (input, parent, owner, captures, instructions) => {
+  try {
+    let result;
+    if (input instanceof RpcPromise) {
+      throw new Error("applyMap() can't be called on RpcPromise");
+    } else if (input instanceof Array) {
+      let payloads = [];
+      try {
+        for (let elem of input) {
+          payloads.push(applyMapToElement(elem, input, owner, captures, instructions));
+        }
+      } catch (err) {
+        for (let payload of payloads) {
+          payload.dispose();
+        }
+        throw err;
+      }
+      result = RpcPayload.fromArray(payloads);
+    } else if (input === null || input === void 0) {
+      result = RpcPayload.fromAppReturn(input);
+    } else {
+      result = applyMapToElement(input, parent, owner, captures, instructions);
+    }
+    return new PayloadStubHook(result);
+  } finally {
+    for (let cap of captures) {
+      cap.dispose();
+    }
+  }
+};
 class ImportTableEntry {
   constructor(session, importId, pulling) {
     this.session = session;
@@ -2339,10 +2673,10 @@ class RpcSessionImpl {
   onBatchDone;
   // How many promises is our peer expecting us to resolve?
   pullCount = 0;
+  currentNegativeExportProvenanceExpr;
   // Sparse array of onBrokenCallback registrations. Items are strictly appended to the end but
   // may be deleted from the middle (hence leaving the array sparse).
   onBrokenCallbacks = [];
-  registryBackedExportRestoreCount = 0;
   trace(phase, detail) {
     try {
       this.options.__experimental_trace?.({
@@ -2360,7 +2694,7 @@ class RpcSessionImpl {
   shutdown() {
     this.abort(new Error("RPC session was shut down by disposing the main stub"), false);
   }
-  exportStub(hook) {
+  exportStub(hook, path) {
     if (this.abortReason) throw this.abortReason;
     let existingExportId = this.reverseExports.get(hook);
     if (existingExportId !== void 0) {
@@ -2369,16 +2703,42 @@ class RpcSessionImpl {
       return existingExportId;
     } else {
       let exportId = this.nextExportId--;
-      this.exports[exportId] = { hook, refcount: 1 };
+      this.exports[exportId] = {
+        hook,
+        refcount: 1,
+        ...this.currentNegativeExportProvenanceExpr !== void 0 ? {
+          provenance: (() => {
+            let mapProgram = __experimental_recordInputPath(path ?? []);
+            return {
+              expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+              captures: mapProgram.captures,
+              instructions: mapProgram.instructions
+            };
+          })()
+        } : {}
+      };
       this.reverseExports.set(hook, exportId);
       this.trace("exportStub.new", { exportId, hookType: hook.constructor?.name ?? null });
       return exportId;
     }
   }
-  exportPromise(hook) {
+  exportPromise(hook, path) {
     if (this.abortReason) throw this.abortReason;
     let exportId = this.nextExportId--;
-    this.exports[exportId] = { hook, refcount: 1 };
+    this.exports[exportId] = {
+      hook,
+      refcount: 1,
+      ...this.currentNegativeExportProvenanceExpr !== void 0 ? {
+        provenance: (() => {
+          let mapProgram = __experimental_recordInputPath(path ?? []);
+          return {
+            expr: structuredClone(this.currentNegativeExportProvenanceExpr),
+            captures: mapProgram.captures,
+            instructions: mapProgram.instructions
+          };
+        })()
+      } : {}
+    };
     this.reverseExports.set(hook, exportId);
     this.trace("exportPromise.new", { exportId, hookType: hook.constructor?.name ?? null });
     this.ensureResolvingExport(exportId);
@@ -2434,7 +2794,7 @@ class RpcSessionImpl {
       this.trace("ensureResolvingExport.start", {
         exportId,
         hasHook: !!exp.hook,
-        descriptorKind: exp.descriptor?.kind ?? null
+        hasProvenance: !!exp.provenance
       });
       let resolve = async () => {
         let hook = this.getOrRestoreExportHook(exportId);
@@ -2460,7 +2820,14 @@ class RpcSessionImpl {
       ++this.pullCount;
       exp.pull = resolve().then(
         (payload) => {
-          let value = Devaluator.devaluate(payload.value, void 0, this, payload);
+          const previousExpr = this.currentNegativeExportProvenanceExpr;
+          this.currentNegativeExportProvenanceExpr = exp.provenance?.expr;
+          let value;
+          try {
+            value = Devaluator.devaluate(payload.value, void 0, this, payload);
+          } finally {
+            this.currentNegativeExportProvenanceExpr = previousExpr;
+          }
           this.trace("ensureResolvingExport.resolve", { exportId, valueType: typeof payload.value });
           this.send(["resolve", exportId, value]);
           if (autoRelease) this.releaseExport(exportId, 1);
@@ -2536,10 +2903,6 @@ class RpcSessionImpl {
     return this.getOrRestoreExportHook(idx);
   }
   __experimental_snapshot() {
-    let registry = this.options.__experimental_hibernationRegistry;
-    if (!registry) {
-      throw new Error("Can't snapshot RPC session without a hibernation registry.");
-    }
     const imports = [];
     for (let i in this.imports) {
       let id = Number(i);
@@ -2558,28 +2921,21 @@ class RpcSessionImpl {
       if (id >= 0) continue;
       let entry = this.exports[i];
       if (!entry) continue;
-      let descriptor = entry.descriptor;
-      if (!descriptor && entry.hook) {
-        descriptor = __experimental_describeStubHookForHibernation(entry.hook, registry);
-        if (descriptor) {
-          entry.descriptor = descriptor;
-        }
-      }
-      if (!descriptor) {
+      if (!entry.provenance) {
         console.error(
-          `[capnweb] Export ${id} is not hibernatable (hook type: ${entry.hook?.constructor?.name ?? "none"}). It will be lost on hibernation. Register it in the hibernation registry to fix this.`
+          `[capnweb] Export ${id} is not hibernatable (hook type: ${entry.hook?.constructor?.name ?? "none"}). It will be lost on hibernation. It needs intrinsic provenance.`
         );
         continue;
       }
       exports$1.push({
         id,
         refcount: entry.refcount,
-        descriptor,
+        provenance: entry.provenance,
         ...entry.pull ? { pulling: true } : {}
       });
     }
     return {
-      version: 1,
+      version: 2,
       nextExportId: this.nextExportId,
       exports: exports$1,
       ...imports.length > 0 ? { imports } : {}
@@ -2694,9 +3050,9 @@ class RpcSessionImpl {
       }
     });
     let value = ["remap", id, path, devaluedCaptures, instructions];
-    this.send(["push", value]);
     let entry = new ImportTableEntry(this, this.imports.length, false);
     this.imports.push(entry);
+    this.send(["push", entry.importId, value]);
     this.trace("sendMap", { importId: entry.importId, targetImportId: id, pathLength: path.length, captureCount: captures.length });
     return new RpcImportHook(
       /*isPromise=*/
@@ -2773,7 +3129,11 @@ class RpcSessionImpl {
               let payload = new Evaluator(this).evaluate(msg[2]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
-              this.replacePositiveExport(exportId, { hook, refcount: 1 });
+              this.replacePositiveExport(exportId, {
+                hook,
+                refcount: 1,
+                provenance: { expr: structuredClone(msg[2]) }
+              });
               this.trace("readLoop.push", { exportId, hookType: hook.constructor?.name ?? null });
               continue;
             }
@@ -2784,7 +3144,12 @@ class RpcSessionImpl {
               let payload = new Evaluator(this).evaluate(msg[2]);
               let hook = new PayloadStubHook(payload);
               hook.ignoreUnhandledRejections();
-              this.replacePositiveExport(exportId, { hook, refcount: 1, autoRelease: true });
+              this.replacePositiveExport(exportId, {
+                hook,
+                refcount: 1,
+                autoRelease: true,
+                provenance: { expr: structuredClone(msg[2]) }
+              });
               this.trace("readLoop.stream", { exportId, hookType: hook.constructor?.name ?? null });
               this.ensureResolvingExport(exportId);
               continue;
@@ -2889,7 +3254,7 @@ class RpcSessionImpl {
         hasHook: !!entry.hook,
         hookType: entry.hook?.constructor?.name ?? null,
         hookIdentity: entry.hook ? __experimental_debugStubHookIdentity(entry.hook) : null,
-        descriptor: entry.descriptor ?? null,
+        provenance: entry.provenance ?? null,
         hasPull: !!entry.pull,
         autoRelease: !!entry.autoRelease,
         hasPipeReadable: !!entry.pipeReadable
@@ -2905,7 +3270,6 @@ class RpcSessionImpl {
       nextExportId: this.nextExportId,
       abortReason: this.abortReason ? String(this.abortReason) : null,
       pullCount: this.pullCount,
-      registryBackedExportRestoreCount: this.registryBackedExportRestoreCount,
       exports: exports$1,
       imports
     };
@@ -2916,23 +3280,64 @@ class RpcSessionImpl {
       throw new Error(`no such export ID: ${exportId}`);
     }
     if (!entry.hook) {
-      const registry = this.options.__experimental_hibernationRegistry;
-      if (!registry || !entry.descriptor) {
-        throw new Error(`Export ${exportId} can't be restored after hibernation.`);
+      if (entry.provenance) {
+        let payload = new Evaluator(this).evaluate(structuredClone(entry.provenance.expr));
+        let hook;
+        if (entry.provenance.instructions) {
+          const captures = (entry.provenance.captures ?? []).map((captureExpr) => {
+            const capturePayload = new Evaluator(this).evaluate(structuredClone(captureExpr));
+            const captureValue = capturePayload.value;
+            if (!(captureValue instanceof RpcStub)) {
+              capturePayload.dispose();
+              throw new Error("Map provenance capture did not evaluate to an RpcStub.");
+            }
+            const { hook: captureHook, pathIfPromise } = unwrapStubAndPath(captureValue);
+            capturePayload.dispose();
+            if (pathIfPromise && pathIfPromise.length > 0) {
+              return captureHook.get(pathIfPromise);
+            } else if (pathIfPromise) {
+              return captureHook.get([]);
+            } else {
+              return captureHook.dup();
+            }
+          });
+          if (payload.value instanceof RpcStub) {
+            const { hook: provenanceHook, pathIfPromise } = unwrapStubAndPath(payload.value);
+            hook = provenanceHook.map(pathIfPromise ?? [], captures, structuredClone(entry.provenance.instructions));
+            payload.dispose();
+          } else {
+            hook = mapImpl.applyMap(
+              payload.value,
+              void 0,
+              payload,
+              captures,
+              structuredClone(entry.provenance.instructions)
+            );
+          }
+        } else {
+          hook = new PayloadStubHook(payload);
+          if (entry.provenance.path && entry.provenance.path.length > 0) {
+            let derived = hook.get(entry.provenance.path);
+            hook.dispose();
+            hook = derived;
+          }
+        }
+        entry.hook = hook;
+        this.reverseExports.set(entry.hook, exportId);
+        this.trace("getOrRestoreExportHook.replay", {
+          exportId,
+          pathLength: entry.provenance.path?.length ?? 0,
+          instructionCount: entry.provenance.instructions?.length ?? 0,
+          hookType: entry.hook.constructor?.name ?? null
+        });
+      } else {
+        throw new Error(`Export ${exportId} can't be restored after hibernation because it has no provenance.`);
       }
-      entry.hook = __experimental_restoreStubHookFromHibernation(entry.descriptor, registry);
-      this.registryBackedExportRestoreCount += 1;
-      this.reverseExports.set(entry.hook, exportId);
-      this.trace("getOrRestoreExportHook.restore", {
-        exportId,
-        descriptorKind: entry.descriptor.kind,
-        hookType: entry.hook.constructor?.name ?? null
-      });
     }
     return entry.hook;
   }
   restoreFromSnapshot(snapshot) {
-    if (snapshot.version !== 1) {
+    if (snapshot.version !== 1 && snapshot.version !== 2) {
       throw new Error(`Unsupported RPC session snapshot version: ${snapshot.version}`);
     }
     this.nextExportId = snapshot.nextExportId;
@@ -2945,12 +3350,12 @@ class RpcSessionImpl {
     for (let exp of snapshot.exports) {
       this.exports[exp.id] = {
         refcount: exp.refcount,
-        descriptor: exp.descriptor
+        ...exp.provenance ? { provenance: exp.provenance } : {}
       };
       this.trace("restoreFromSnapshot.export", {
         exportId: exp.id,
         refcount: exp.refcount,
-        descriptorKind: exp.descriptor.kind,
+        hasProvenance: !!exp.provenance,
         pulling: !!exp.pulling
       });
       if (exp.pulling) {
@@ -3029,7 +3434,6 @@ async function __experimental_newHibernatableWebSocketRpcSession$1(webSocket, lo
   }, trace);
   rpc = new RpcSession(transport, localMain, {
     ...options,
-    __experimental_hibernationRegistry: options.hibernationRegistry,
     __experimental_restoreSnapshot: snapshot,
     __experimental_trace: (event) => trace(event)
   });
@@ -3212,257 +3616,6 @@ class HibernatableWebSocketTransport {
     }
   }
 }
-let currentMapBuilder;
-class MapBuilder {
-  context;
-  captureMap = /* @__PURE__ */ new Map();
-  instructions = [];
-  constructor(subject, path) {
-    if (currentMapBuilder) {
-      this.context = {
-        parent: currentMapBuilder,
-        captures: [],
-        subject: currentMapBuilder.capture(subject),
-        path
-      };
-    } else {
-      this.context = {
-        parent: void 0,
-        captures: [],
-        subject,
-        path
-      };
-    }
-    currentMapBuilder = this;
-  }
-  unregister() {
-    currentMapBuilder = this.context.parent;
-  }
-  makeInput() {
-    return new MapVariableHook(this, 0);
-  }
-  makeOutput(result) {
-    let devalued;
-    try {
-      devalued = Devaluator.devaluate(result.value, void 0, this, result);
-    } finally {
-      result.dispose();
-    }
-    this.instructions.push(devalued);
-    if (this.context.parent) {
-      this.context.parent.instructions.push(
-        [
-          "remap",
-          this.context.subject,
-          this.context.path,
-          this.context.captures.map((cap) => ["import", cap]),
-          this.instructions
-        ]
-      );
-      return new MapVariableHook(this.context.parent, this.context.parent.instructions.length);
-    } else {
-      return this.context.subject.map(this.context.path, this.context.captures, this.instructions);
-    }
-  }
-  pushCall(hook, path, params) {
-    let devalued = Devaluator.devaluate(params.value, void 0, this, params);
-    devalued = devalued[0];
-    let subject = this.capture(hook.dup());
-    this.instructions.push(["pipeline", subject, path, devalued]);
-    return new MapVariableHook(this, this.instructions.length);
-  }
-  pushGet(hook, path) {
-    let subject = this.capture(hook.dup());
-    this.instructions.push(["pipeline", subject, path]);
-    return new MapVariableHook(this, this.instructions.length);
-  }
-  capture(hook) {
-    if (hook instanceof MapVariableHook && hook.mapper === this) {
-      return hook.idx;
-    }
-    let result = this.captureMap.get(hook);
-    if (result === void 0) {
-      if (this.context.parent) {
-        let parentIdx = this.context.parent.capture(hook);
-        this.context.captures.push(parentIdx);
-      } else {
-        this.context.captures.push(hook);
-      }
-      result = -this.context.captures.length;
-      this.captureMap.set(hook, result);
-    }
-    return result;
-  }
-  // ---------------------------------------------------------------------------
-  // implements Exporter
-  exportStub(hook) {
-    throw new Error(
-      "Can't construct an RpcTarget or RPC callback inside a mapper function. Try creating a new RpcStub outside the callback first, then using it inside the callback."
-    );
-  }
-  exportPromise(hook) {
-    return this.exportStub(hook);
-  }
-  getImport(hook) {
-    return this.capture(hook);
-  }
-  unexport(ids) {
-  }
-  createPipe(readable) {
-    throw new Error("Cannot send ReadableStream inside a mapper function.");
-  }
-  onSendError(error) {
-  }
-}
-mapImpl.sendMap = (hook, path, func) => {
-  let builder = new MapBuilder(hook, path);
-  let result;
-  try {
-    result = RpcPayload.fromAppReturn(withCallInterceptor(builder.pushCall.bind(builder), () => {
-      return func(new RpcPromise(builder.makeInput(), []));
-    }));
-  } finally {
-    builder.unregister();
-  }
-  if (result instanceof Promise) {
-    result.catch((err) => {
-    });
-    throw new Error("RPC map() callbacks cannot be async.");
-  }
-  return new RpcPromise(builder.makeOutput(result), []);
-};
-function throwMapperBuilderUseError() {
-  throw new Error(
-    "Attempted to use an abstract placeholder from a mapper function. Please make sure your map function has no side effects."
-  );
-}
-class MapVariableHook extends StubHook {
-  constructor(mapper, idx) {
-    super();
-    this.mapper = mapper;
-    this.idx = idx;
-  }
-  // We don't have anything we actually need to dispose, so dup() can just return the same hook.
-  dup() {
-    return this;
-  }
-  dispose() {
-  }
-  get(path) {
-    if (path.length == 0) {
-      return this;
-    } else if (currentMapBuilder) {
-      return currentMapBuilder.pushGet(this, path);
-    } else {
-      throwMapperBuilderUseError();
-    }
-  }
-  // Other methods should never be called.
-  call(path, args) {
-    throwMapperBuilderUseError();
-  }
-  map(path, captures, instructions) {
-    throwMapperBuilderUseError();
-  }
-  pull() {
-    throwMapperBuilderUseError();
-  }
-  ignoreUnhandledRejections() {
-  }
-  onBroken(callback) {
-    throwMapperBuilderUseError();
-  }
-}
-class MapApplicator {
-  constructor(captures, input) {
-    this.captures = captures;
-    this.variables = [input];
-  }
-  variables;
-  dispose() {
-    for (let variable of this.variables) {
-      variable.dispose();
-    }
-  }
-  apply(instructions) {
-    try {
-      if (instructions.length < 1) {
-        throw new Error("Invalid empty mapper function.");
-      }
-      for (let instruction of instructions.slice(0, -1)) {
-        let payload = new Evaluator(this).evaluateCopy(instruction);
-        if (payload.value instanceof RpcStub) {
-          let hook = unwrapStubNoProperties(payload.value);
-          if (hook) {
-            this.variables.push(hook);
-            continue;
-          }
-        }
-        this.variables.push(new PayloadStubHook(payload));
-      }
-      return new Evaluator(this).evaluateCopy(instructions[instructions.length - 1]);
-    } finally {
-      for (let variable of this.variables) {
-        variable.dispose();
-      }
-    }
-  }
-  importStub(idx) {
-    throw new Error("A mapper function cannot refer to exports.");
-  }
-  importPromise(idx) {
-    return this.importStub(idx);
-  }
-  getExport(idx) {
-    if (idx < 0) {
-      return this.captures[-idx - 1];
-    } else {
-      return this.variables[idx];
-    }
-  }
-  getPipeReadable(exportId) {
-    throw new Error("A mapper function cannot use pipe readables.");
-  }
-}
-function applyMapToElement(input, parent, owner, captures, instructions) {
-  let inputHook = new PayloadStubHook(RpcPayload.deepCopyFrom(input, parent, owner));
-  let mapper = new MapApplicator(captures, inputHook);
-  try {
-    return mapper.apply(instructions);
-  } finally {
-    mapper.dispose();
-  }
-}
-mapImpl.applyMap = (input, parent, owner, captures, instructions) => {
-  try {
-    let result;
-    if (input instanceof RpcPromise) {
-      throw new Error("applyMap() can't be called on RpcPromise");
-    } else if (input instanceof Array) {
-      let payloads = [];
-      try {
-        for (let elem of input) {
-          payloads.push(applyMapToElement(elem, input, owner, captures, instructions));
-        }
-      } catch (err) {
-        for (let payload of payloads) {
-          payload.dispose();
-        }
-        throw err;
-      }
-      result = RpcPayload.fromArray(payloads);
-    } else if (input === null || input === void 0) {
-      result = RpcPayload.fromAppReturn(input);
-    } else {
-      result = applyMapToElement(input, parent, owner, captures, instructions);
-    }
-    return new PayloadStubHook(result);
-  } finally {
-    for (let cap of captures) {
-      cap.dispose();
-    }
-  }
-};
 class WritableStreamStubHook extends StubHook {
   state;
   // undefined when disposed
@@ -3836,15 +3989,76 @@ class ChatRoomProxy extends RpcTarget {
     return this.env.CHAT_ROOM.getByName(this.roomName).getMessageCount();
   }
 }
+class HiddenArgProbe extends RpcTarget {
+  constructor(ctx, label, secret) {
+    super();
+    this.ctx = ctx;
+    this.label = label;
+    this.#secret = secret;
+  }
+  #secret;
+  async getStorageKind() {
+    return this.ctx.storage.constructor?.name ?? "unknown";
+  }
+  getVisibleLabel() {
+    return this.label;
+  }
+  getSecretEcho() {
+    return this.#secret;
+  }
+  getSecretLength() {
+    return this.#secret.length;
+  }
+}
+class ChatRoomCapability extends RpcTarget {
+  constructor(ctx, roomName) {
+    super();
+    this.ctx = ctx;
+    this.roomName = roomName;
+  }
+  async postMessage(user, text) {
+    const messages = await this.ctx.storage.get("messages") ?? [];
+    const last = { user, text, at: Date.now() };
+    messages.push(last);
+    await this.ctx.storage.put("messages", messages);
+    return { count: messages.length, last };
+  }
+  async listMessages() {
+    return await this.ctx.storage.get("messages") ?? [];
+  }
+  async getMessageCount() {
+    return (await this.ctx.storage.get("messages") ?? []).length;
+  }
+}
+class ChatRoomRootTarget extends RpcTarget {
+  constructor(ctx, roomName, host) {
+    super();
+    this.ctx = ctx;
+    this.roomName = roomName;
+    this.host = host;
+  }
+  getRoomCapability() {
+    return new ChatRoomCapability(this.ctx, this.roomName);
+  }
+  getInstanceId() {
+    return this.host.instanceId;
+  }
+}
 class ChatRoomDo extends DurableObject {
   instanceId;
+  roomSessionStore;
+  roomSessions = /* @__PURE__ */ new Map();
+  roomReady;
   constructor(ctx, env) {
     super(ctx, env);
     this.instanceId = crypto.randomUUID();
+    this.roomSessionStore = __experimental_newDurableObjectSessionStore(ctx.storage, "room-hib:");
     console.log("[ChatRoomDo] constructor", JSON.stringify({
       instanceId: this.instanceId,
+      existingSocketCount: this.ctx.getWebSockets("capnweb-room").length,
       at: (/* @__PURE__ */ new Date()).toISOString()
     }));
+    this.roomReady = this.restoreRoomSessions();
   }
   async fetch(req) {
     const url = new URL(req.url);
@@ -3865,6 +4079,17 @@ class ChatRoomDo extends DurableObject {
         lastMessage: messages.at(-1) ?? null
       });
     }
+    if (url.pathname === "/ws") {
+      if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("Expected WebSocket upgrade", { status: 426 });
+      }
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.ctx.acceptWebSocket(server, ["capnweb-room"]);
+      await this.roomReady;
+      await this.attachRoomSession(server);
+      return new Response(null, { status: 101, webSocket: client });
+    }
     return new Response("Not found", { status: 404 });
   }
   async postMessage(user, text) {
@@ -3880,6 +4105,62 @@ class ChatRoomDo extends DurableObject {
   async getMessageCount() {
     return (await this.ctx.storage.get("messages") ?? []).length;
   }
+  getRoomCapability(roomName) {
+    return new ChatRoomCapability(this.ctx, roomName);
+  }
+  async webSocketMessage(ws, message) {
+    await this.roomReady;
+    const session = await this.getOrAttachRoomSession(ws);
+    session.handleMessage(message);
+  }
+  async webSocketClose(ws, code, reason, wasClean) {
+    await this.roomReady;
+    const sid = this.getRoomSessionId(ws);
+    const session = sid ? this.roomSessions.get(sid) : void 0;
+    session?.handleClose(code, reason, wasClean);
+    if (sid) this.roomSessions.delete(sid);
+  }
+  async webSocketError(ws, error) {
+    await this.roomReady;
+    const sid = this.getRoomSessionId(ws);
+    const session = sid ? this.roomSessions.get(sid) : void 0;
+    session?.handleError(error);
+  }
+  async restoreRoomSessions() {
+    for (const ws of this.ctx.getWebSockets("capnweb-room")) {
+      await this.attachRoomSession(ws);
+    }
+  }
+  async getOrAttachRoomSession(ws) {
+    const sid = this.getRoomSessionId(ws);
+    if (sid && this.roomSessions.has(sid)) {
+      return this.roomSessions.get(sid);
+    }
+    return this.attachRoomSession(ws);
+  }
+  async attachRoomSession(ws) {
+    const knownSessionId = this.getRoomSessionId(ws);
+    const session = await __experimental_newHibernatableWebSocketRpcSession(
+      ws,
+      new ChatRoomRootTarget(this.ctx, "direct-room", this),
+      {
+        sessionStore: this.roomSessionStore,
+        onSendError(err) {
+          return err;
+        },
+        sessionId: knownSessionId
+      }
+    );
+    this.roomSessions.set(session.sessionId, session);
+    return session;
+  }
+  getRoomSessionId(ws) {
+    const attachment = ws.deserializeAttachment?.();
+    if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
+      return attachment.sessionId;
+    }
+    return void 0;
+  }
 }
 class RootTarget extends RpcTarget {
   constructor(ctx, env, host) {
@@ -3893,6 +4174,23 @@ class RootTarget extends RpcTarget {
   }
   getChatRoom(roomName) {
     return new ChatRoomProxy(this.env, roomName);
+  }
+  getHiddenArgProbe(label, secret) {
+    return new HiddenArgProbe(this.ctx, label, secret);
+  }
+  storeClientCallback(name, callback) {
+    this.host.clientCallbacks.set(name, typeof callback?.dup === "function" ? callback.dup() : callback);
+    return this.host.clientCallbacks.size;
+  }
+  getStoredClientCallbackCount() {
+    return this.host.clientCallbacks.size;
+  }
+  async invokeStoredClientCallback(name, message) {
+    const callback = this.host.clientCallbacks.get(name);
+    if (!callback) {
+      throw new Error(`No stored client callback named ${name}`);
+    }
+    return callback.notify(message);
   }
   square(n) {
     return n * n;
@@ -3908,32 +4206,7 @@ class RootTarget extends RpcTarget {
     return this.getDurableCounter(name).increment(amount);
   }
 }
-class HibernationRegistry {
-  constructor(ctx, env) {
-    this.ctx = ctx;
-    this.env = env;
-  }
-  describe(target) {
-    if (target instanceof DurableCounterProxy) {
-      return { kind: "durable-counter", key: target.key };
-    }
-    if (target instanceof ChatRoomProxy) {
-      return { kind: "chat-room", roomName: target.roomName };
-    }
-    return void 0;
-  }
-  restore(descriptor) {
-    if (descriptor?.kind === "durable-counter" && typeof descriptor.key === "string") {
-      return new DurableCounterProxy(this.ctx, descriptor.key);
-    }
-    if (descriptor?.kind === "chat-room" && typeof descriptor.roomName === "string") {
-      return new ChatRoomProxy(this.env, descriptor.roomName);
-    }
-    throw new Error(`Unknown hibernation descriptor: ${JSON.stringify(descriptor)}`);
-  }
-}
 class HibRpcDo extends DurableObject {
-  registry;
   sessionStore;
   sessions = /* @__PURE__ */ new Map();
   ready;
@@ -3946,10 +4219,10 @@ class HibRpcDo extends DurableObject {
   createdSessionCount = 0;
   lastMessageKind = null;
   sessionTraces = /* @__PURE__ */ new Map();
+  clientCallbacks = /* @__PURE__ */ new Map();
   constructor(ctx, env) {
     super(ctx, env);
     this.instanceId = crypto.randomUUID();
-    this.registry = new HibernationRegistry(ctx, env);
     this.sessionStore = __experimental_newDurableObjectSessionStore(ctx.storage, "hib:");
     const existingSockets = this.ctx.getWebSockets("capnweb");
     console.log("[HibRpcDo] constructor", JSON.stringify({
@@ -4042,7 +4315,8 @@ class HibRpcDo extends DurableObject {
           webSocketMessageCount: this.webSocketMessageCount,
           reusedSessionCount: this.reusedSessionCount,
           createdSessionCount: this.createdSessionCount,
-          lastMessageKind: this.lastMessageKind
+          lastMessageKind: this.lastMessageKind,
+          clientCallbackCount: this.clientCallbacks.size
         },
         sessions: diagnostics
       });
@@ -4139,7 +4413,6 @@ class HibRpcDo extends DurableObject {
       ws,
       new RootTarget(this.ctx, this.env, this),
       {
-        hibernationRegistry: this.registry,
         sessionStore: this.sessionStore,
         onSendError(err) {
           return err;
@@ -4218,6 +4491,16 @@ const index = {
       const stub = env.CHAT_ROOM.getByName(roomName);
       const innerUrl = new URL(request.url);
       innerUrl.pathname = url.pathname === "/chat-room-instance" ? "/instance-id" : "/diagnostics";
+      return stub.fetch(new Request(innerUrl.toString(), request));
+    }
+    if (url.pathname === "/chat-room-ws") {
+      const roomName = url.searchParams.get("room");
+      if (!roomName) {
+        return new Response("Missing room query parameter", { status: 400 });
+      }
+      const stub = env.CHAT_ROOM.getByName(roomName);
+      const innerUrl = new URL(request.url);
+      innerUrl.pathname = "/ws";
       return stub.fetch(new Request(innerUrl.toString(), request));
     }
     return new Response("Not found", { status: 404 });

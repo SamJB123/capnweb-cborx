@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { unstable_dev } from "wrangler";
 import type { UnstableDevWorker } from "wrangler";
 import { WebSocket } from "ws";
-import { newWebSocketRpcSession, __experimental_debugRpcReference } from "../src/index.ts";
+import { RpcTarget, newWebSocketRpcSession, __experimental_debugRpcReference } from "../src/index.ts";
 
 let worker: UnstableDevWorker;
 
@@ -22,6 +22,18 @@ function connectWebSocket(): Promise<WebSocket> {
     const ws = new WebSocket(`http://${worker.address}:${worker.port}/ws`, {
       headers: { Upgrade: "websocket" },
     });
+    ws.on("open", () => resolve(ws));
+    ws.on("error", reject);
+  });
+}
+
+function connectRoomWebSocket(roomName: string): Promise<WebSocket> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(
+        `http://${worker.address}:${worker.port}/chat-room-ws?room=${encodeURIComponent(roomName)}`,
+        {
+          headers: { Upgrade: "websocket" },
+        });
     ws.on("open", () => resolve(ws));
     ws.on("error", reject);
   });
@@ -108,7 +120,14 @@ function findDurableCounterExport(
     key: string) {
   return diagnostics.sessions
       .flatMap(session => session.debugState?.exports ?? [])
-      .find((exp: any) => exp?.descriptor?.kind === "durable-counter" && exp?.descriptor?.key === key);
+      .find((exp: any) =>
+        Array.isArray(exp?.provenance?.expr) &&
+        exp.provenance.expr[0] === "pipeline" &&
+        exp.provenance.expr[1] === 0 &&
+        Array.isArray(exp.provenance.expr[2]) &&
+        exp.provenance.expr[2][0] === "getDurableCounter" &&
+        Array.isArray(exp.provenance.expr[3]) &&
+        exp.provenance.expr[3][0] === key);
 }
 
 function logResumeState(label: string, diagnostics: Awaited<ReturnType<typeof getResumeDiagnostics>>) {
@@ -237,6 +256,32 @@ describe("real hibernatable DO with capnweb RPC", () => {
     }
   });
 
+  it("direct client-to-room capnweb websocket keeps a held room capability working after room hibernation", { timeout: 30_000 }, async () => {
+    const roomName = uniqueKey("direct-room");
+    const ws = await connectRoomWebSocket(roomName);
+    try {
+      const root = newWebSocketRpcSession<any>(ws as any);
+      const room = await root.getRoomCapability();
+
+      expect(await room.postMessage("sam", "hello direct room")).toMatchObject({
+        count: 1,
+        last: { user: "sam", text: "hello direct room" },
+      });
+      expect(await room.getMessageCount()).toBe(1);
+
+      const idBefore = await root.getInstanceId();
+      await waitForHibernation(idBefore);
+
+      expect(await room.postMessage("sam", "after direct wake")).toMatchObject({
+        count: 2,
+        last: { user: "sam", text: "after direct wake" },
+      });
+      expect(await room.getMessageCount()).toBe(2);
+    } finally {
+      ws.close();
+    }
+  });
+
   it("restores a server-side session object from the attachment before any post-wake RPC", { timeout: 30_000 }, async () => {
     const ws = await connectWebSocket();
     try {
@@ -317,7 +362,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
     }
   });
 
-  it("restored session preserves hibernatable child export descriptors in the attachment snapshot", { timeout: 30_000 }, async () => {
+  it("restored session preserves hibernatable child export provenance in the attachment snapshot", { timeout: 30_000 }, async () => {
     const ws = await connectWebSocket();
     try {
       const root = newWebSocketRpcSession<any>(ws as any);
@@ -373,7 +418,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
       const restoredExport = findDurableCounterExport(afterWake, key);
       expect(restoredExport).toBeDefined();
       expect(restoredExport.hasHook).toBe(false);
-      expect(restoredExport.descriptor).toEqual({ kind: "durable-counter", key });
+      expect(restoredExport.provenance?.expr).toEqual(["pipeline", 0, ["getDurableCounter"], [key]]);
       logSideBySide(
           "after-wake before use: root vs bootstrap export",
           "client root ref",
@@ -394,7 +439,7 @@ describe("real hibernatable DO with capnweb RPC", () => {
       expect(rebuiltExport).toBeDefined();
       expect(rebuiltExport.hasHook).toBe(true);
       expect(rebuiltExport.hookType).toBe("TargetStubHook");
-      expect(rebuiltExport.descriptor).toEqual({ kind: "durable-counter", key });
+      expect(rebuiltExport.provenance?.expr).toEqual(["pipeline", 0, ["getDurableCounter"], [key]]);
       logSideBySide(
           "after first post-wake use: root vs bootstrap export",
           "client root ref",
@@ -582,6 +627,39 @@ describe("real hibernatable DO with capnweb RPC", () => {
       const counter2 = await withTimeout(root.getDurableCounter(key));
       expect(await withTimeout(counter2.getValue())).toBe(100);
       expect(await withTimeout(counter2.increment(1))).toBe(101);
+    } finally {
+      ws.close();
+    }
+  });
+
+  it("holding a client-minted callback stub in the hub does not prevent hub hibernation", { timeout: 30_000 }, async () => {
+    class ClientCallback extends RpcTarget {
+      notifications: string[] = [];
+
+      notify(message: string) {
+        this.notifications.push(message);
+        return { ok: true, count: this.notifications.length };
+      }
+    }
+
+    const ws = await connectWebSocket();
+    try {
+      const root = newWebSocketRpcSession<any>(ws as any);
+      const callback = new ClientCallback();
+      const callbackName = uniqueKey("client-callback");
+
+      expect(await root.storeClientCallback(callbackName, callback)).toBe(1);
+      expect(await root.getStoredClientCallbackCount()).toBe(1);
+
+      const beforeDiagnostics = await getResumeDiagnostics();
+      expect(beforeDiagnostics.counters.clientCallbackCount).toBe(1);
+
+      const idBefore = await root.getInstanceId();
+      await waitForHibernation(idBefore);
+
+      const afterDiagnostics = await getResumeDiagnostics();
+      expect(afterDiagnostics.counters.restoreAttempts).toBeGreaterThan(0);
+      expect(afterDiagnostics.counters.restoreSuccesses).toBeGreaterThan(0);
     } finally {
       ws.close();
     }

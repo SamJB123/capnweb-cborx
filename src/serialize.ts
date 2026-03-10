@@ -10,8 +10,8 @@ export type ExportId = number;
 // =======================================================================================
 
 export interface Exporter {
-  exportStub(hook: StubHook): ExportId;
-  exportPromise(hook: StubHook): ExportId;
+  exportStub(hook: StubHook, path?: (string | number)[]): ExportId;
+  exportPromise(hook: StubHook, path?: (string | number)[]): ExportId;
   getImport(hook: StubHook): ImportId | undefined;
 
   // If a serialization error occurs after having exported some capabilities, this will be called
@@ -72,7 +72,7 @@ export class Devaluator {
       : unknown {
     let devaluator = new Devaluator(exporter, source);
     try {
-      return devaluator.devaluateImpl(value, parent, 0);
+      return devaluator.devaluateImpl(value, parent, 0, []);
     } catch (err) {
       if (devaluator.exports) {
         try {
@@ -87,7 +87,8 @@ export class Devaluator {
 
   private exports?: Array<ExportId>;
 
-  private devaluateImpl(value: unknown, parent: object | undefined, depth: number): unknown {
+  private devaluateImpl(
+      value: unknown, parent: object | undefined, depth: number, path: (string | number)[]): unknown {
     if (depth >= 64) {
       throw new Error(
           "Serialization exceeded maximum allowed depth. (Does the message contain cycles?)");
@@ -123,7 +124,7 @@ export class Devaluator {
         let object = <Record<string, unknown>>value;
         let result: Record<string, unknown> = {};
         for (let key in object) {
-          result[key] = this.devaluateImpl(object[key], object, depth + 1);
+          result[key] = this.devaluateImpl(object[key], object, depth + 1, path.concat(key));
         }
         return result;
       }
@@ -133,7 +134,7 @@ export class Devaluator {
         let len = array.length;
         let result = new Array(len);
         for (let i = 0; i < len; i++) {
-          result[i] = this.devaluateImpl(array[i], array, depth + 1);
+          result[i] = this.devaluateImpl(array[i], array, depth + 1, path.concat(i));
         }
         // Wrap literal arrays in an outer one-element array, to "escape" them.
         return [result];
@@ -188,7 +189,7 @@ export class Devaluator {
         }
 
         if (req.body) {
-          init.body = this.devaluateImpl(req.body, req, depth + 1);
+          init.body = this.devaluateImpl(req.body, req, depth + 1, path.concat("body"));
 
           // Apparently the fetch spec technically requires that `duplex` be specified when a
           // body is specified, and Chrome in fact requires this, and requires the value is "half".
@@ -264,7 +265,7 @@ export class Devaluator {
 
       case "response": {
         let resp = <Response>value;
-        let body = this.devaluateImpl(resp.body, resp, depth + 1);
+        let body = this.devaluateImpl(resp.body, resp, depth + 1, path.concat("body"));
         let init: Record<string, unknown> = {};
 
         if (resp.status !== 200) init.status = resp.status;
@@ -342,7 +343,7 @@ export class Devaluator {
           hook = hook.dup();
         }
 
-        return this.devaluateHook(pathIfPromise ? "promise" : "export", hook);
+        return this.devaluateHook(pathIfPromise ? "promise" : "export", hook, path);
       }
 
       case "function":
@@ -352,7 +353,7 @@ export class Devaluator {
         }
 
         let hook = this.source.getHookForRpcTarget(<RpcTarget|Function>value, parent);
-        return this.devaluateHook("export", hook);
+        return this.devaluateHook("export", hook, path);
       }
 
       case "rpc-thenable": {
@@ -361,7 +362,7 @@ export class Devaluator {
         }
 
         let hook = this.source.getHookForRpcTarget(<RpcTarget>value, parent);
-        return this.devaluateHook("promise", hook);
+        return this.devaluateHook("promise", hook, path);
       }
 
       case "writable": {
@@ -370,7 +371,7 @@ export class Devaluator {
         }
 
         let hook = this.source.getHookForWritableStream(<WritableStream>value, parent);
-        return this.devaluateHook("writable", hook);
+        return this.devaluateHook("writable", hook, path);
       }
 
       case "readable": {
@@ -393,10 +394,13 @@ export class Devaluator {
     }
   }
 
-  private devaluateHook(type: "export" | "promise" | "writable", hook: StubHook): unknown {
+  private devaluateHook(
+      type: "export" | "promise" | "writable",
+      hook: StubHook,
+      path: (string | number)[]): unknown {
     if (!this.exports) this.exports = [];
-    let exportId = type === "promise" ? this.exporter.exportPromise(hook)
-                                      : this.exporter.exportStub(hook);
+    let exportId = type === "promise" ? this.exporter.exportPromise(hook, path)
+                                      : this.exporter.exportStub(hook, path);
     this.exports.push(exportId);
     return [type, exportId];
   }

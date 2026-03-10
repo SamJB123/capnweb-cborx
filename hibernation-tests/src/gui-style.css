@@ -60,6 +60,49 @@ h1, h2 {
   margin-bottom: 20px;
 }
 
+.controls--global {
+  margin-bottom: 16px;
+}
+
+.scenario-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+  margin-bottom: 20px;
+}
+
+.scenario {
+  margin-bottom: 0;
+  background:
+    linear-gradient(180deg, rgba(255, 248, 237, 0.94), rgba(255, 252, 247, 0.9));
+}
+
+.scenario--utility {
+  background:
+    linear-gradient(180deg, rgba(240, 246, 250, 0.95), rgba(255, 252, 247, 0.9));
+}
+
+.scenario__header {
+  margin-bottom: 12px;
+}
+
+.scenario__header h2 {
+  margin-bottom: 6px;
+}
+
+.scenario__header p {
+  margin: 0;
+  color: #54493c;
+}
+
+.scenario__eyebrow {
+  margin: 0 0 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 0.74rem;
+  color: #8d6520;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -79,6 +122,10 @@ h1, h2 {
 }
 
 .status-grid--eight {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+.status-grid--twelve {
   grid-template-columns: repeat(4, minmax(0, 1fr));
 }
 
@@ -292,7 +339,8 @@ pre {
 @media (max-width: 900px) {
   .field-grid,
   .status-grid,
-  .grid {
+  .grid,
+  .scenario-grid {
     grid-template-columns: 1fr;
   }
 

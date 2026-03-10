@@ -1,6 +1,8 @@
 import {
   __experimental_newDurableObjectSessionStore,
   __experimental_newHibernatableWebSocketRpcSession,
+} from "../../src/index-workers.ts";
+import {
   RpcTarget,
 } from "../../src/index.ts";
 import { DurableObject } from "cloudflare:workers";
@@ -57,16 +59,91 @@ class ChatRoomProxy extends RpcTarget {
   }
 }
 
+class HiddenArgProbe extends RpcTarget {
+  #secret: string;
+
+  constructor(
+      private ctx: DurableObjectState,
+      readonly label: string,
+      secret: string) {
+    super();
+    this.#secret = secret;
+  }
+
+  async getStorageKind() {
+    return this.ctx.storage.constructor?.name ?? "unknown";
+  }
+
+  getVisibleLabel() {
+    return this.label;
+  }
+
+  getSecretEcho() {
+    return this.#secret;
+  }
+
+  getSecretLength() {
+    return this.#secret.length;
+  }
+}
+
+class ChatRoomCapability extends RpcTarget {
+  constructor(
+      private ctx: DurableObjectState,
+      readonly roomName: string) {
+    super();
+  }
+
+  async postMessage(user: string, text: string) {
+    const messages = ((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? [];
+    const last = { user, text, at: Date.now() };
+    messages.push(last);
+    await this.ctx.storage.put("messages", messages);
+    return { count: messages.length, last };
+  }
+
+  async listMessages() {
+    return ((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? [];
+  }
+
+  async getMessageCount() {
+    return (((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? []).length;
+  }
+}
+
+class ChatRoomRootTarget extends RpcTarget {
+  constructor(
+      private ctx: DurableObjectState,
+      private roomName: string,
+      private host: ChatRoomDo) {
+    super();
+  }
+
+  getRoomCapability() {
+    return new ChatRoomCapability(this.ctx, this.roomName);
+  }
+
+  getInstanceId() {
+    return this.host.instanceId;
+  }
+}
+
 export class ChatRoomDo extends DurableObject {
   instanceId: string;
+  roomSessionStore: ReturnType<typeof __experimental_newDurableObjectSessionStore>;
+  roomSessions = new Map<string, any>();
+  roomReady: Promise<void>;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.instanceId = crypto.randomUUID();
+    this.roomSessionStore = __experimental_newDurableObjectSessionStore(ctx.storage, "room-hib:");
     console.log("[ChatRoomDo] constructor", JSON.stringify({
       instanceId: this.instanceId,
+      existingSocketCount: this.ctx.getWebSockets("capnweb-room").length,
       at: new Date().toISOString(),
     }));
+    this.roomReady = this.restoreRoomSessions();
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -91,6 +168,19 @@ export class ChatRoomDo extends DurableObject {
       });
     }
 
+    if (url.pathname === "/ws") {
+      if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("Expected WebSocket upgrade", { status: 426 });
+      }
+
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.ctx.acceptWebSocket(server, ["capnweb-room"]);
+      await this.roomReady;
+      await this.attachRoomSession(server);
+      return new Response(null, { status: 101, webSocket: client });
+    }
+
     return new Response("Not found", { status: 404 });
   }
 
@@ -109,6 +199,67 @@ export class ChatRoomDo extends DurableObject {
   async getMessageCount(): Promise<number> {
     return (((await this.ctx.storage.get("messages")) as ChatMessage[] | undefined) ?? []).length;
   }
+
+  getRoomCapability(roomName: string): ChatRoomCapability {
+    return new ChatRoomCapability(this.ctx, roomName);
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    await this.roomReady;
+    const session = await this.getOrAttachRoomSession(ws);
+    session.handleMessage(message);
+  }
+
+  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+    await this.roomReady;
+    const sid = this.getRoomSessionId(ws);
+    const session = sid ? this.roomSessions.get(sid) : undefined;
+    session?.handleClose(code, reason, wasClean);
+    if (sid) this.roomSessions.delete(sid);
+  }
+
+  async webSocketError(ws: WebSocket, error: unknown) {
+    await this.roomReady;
+    const sid = this.getRoomSessionId(ws);
+    const session = sid ? this.roomSessions.get(sid) : undefined;
+    session?.handleError(error);
+  }
+
+  private async restoreRoomSessions() {
+    for (const ws of this.ctx.getWebSockets("capnweb-room")) {
+      await this.attachRoomSession(ws);
+    }
+  }
+
+  private async getOrAttachRoomSession(ws: WebSocket) {
+    const sid = this.getRoomSessionId(ws);
+    if (sid && this.roomSessions.has(sid)) {
+      return this.roomSessions.get(sid);
+    }
+    return this.attachRoomSession(ws);
+  }
+
+  private async attachRoomSession(ws: WebSocket) {
+    const knownSessionId = this.getRoomSessionId(ws);
+      const session = await __experimental_newHibernatableWebSocketRpcSession(
+        ws as any,
+        new ChatRoomRootTarget(this.ctx, "direct-room", this),
+        {
+          sessionStore: this.roomSessionStore,
+          onSendError(err) { return err; },
+          sessionId: knownSessionId,
+        });
+    this.roomSessions.set(session.sessionId, session);
+    return session;
+  }
+
+  private getRoomSessionId(ws: WebSocket): string | undefined {
+    const attachment = (ws as any).deserializeAttachment?.();
+    if (attachment && attachment.version === 1 && typeof attachment.sessionId === "string") {
+      return attachment.sessionId;
+    }
+    return undefined;
+  }
 }
 
 class RootTarget extends RpcTarget {
@@ -125,6 +276,27 @@ class RootTarget extends RpcTarget {
 
   getChatRoom(roomName: string) {
     return new ChatRoomProxy(this.env, roomName);
+  }
+
+  getHiddenArgProbe(label: string, secret: string) {
+    return new HiddenArgProbe(this.ctx, label, secret);
+  }
+
+  storeClientCallback(name: string, callback: any) {
+    this.host.clientCallbacks.set(name, typeof callback?.dup === "function" ? callback.dup() : callback);
+    return this.host.clientCallbacks.size;
+  }
+
+  getStoredClientCallbackCount() {
+    return this.host.clientCallbacks.size;
+  }
+
+  async invokeStoredClientCallback(name: string, message: string) {
+    const callback = this.host.clientCallbacks.get(name);
+    if (!callback) {
+      throw new Error(`No stored client callback named ${name}`);
+    }
+    return callback.notify(message);
   }
 
   square(n: number) {
@@ -145,34 +317,7 @@ class RootTarget extends RpcTarget {
   }
 }
 
-class HibernationRegistry {
-  constructor(
-      private ctx: DurableObjectState,
-      private env: Env) {}
-
-  describe(target: RpcTarget | Function) {
-    if (target instanceof DurableCounterProxy) {
-      return { kind: "durable-counter", key: target.key };
-    }
-    if (target instanceof ChatRoomProxy) {
-      return { kind: "chat-room", roomName: target.roomName };
-    }
-    return undefined;
-  }
-
-  restore(descriptor: { kind: string; key?: string; roomName?: string }) {
-    if (descriptor?.kind === "durable-counter" && typeof descriptor.key === "string") {
-      return new DurableCounterProxy(this.ctx, descriptor.key);
-    }
-    if (descriptor?.kind === "chat-room" && typeof descriptor.roomName === "string") {
-      return new ChatRoomProxy(this.env, descriptor.roomName);
-    }
-    throw new Error(`Unknown hibernation descriptor: ${JSON.stringify(descriptor)}`);
-  }
-}
-
 export class HibRpcDo extends DurableObject {
-  registry: HibernationRegistry;
   sessionStore: ReturnType<typeof __experimental_newDurableObjectSessionStore>;
   sessions = new Map<string, any>();
   ready: Promise<void>;
@@ -190,11 +335,11 @@ export class HibRpcDo extends DurableObject {
     phase: string;
     detail?: Record<string, unknown>;
   }>>();
+  clientCallbacks = new Map<string, any>();
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.instanceId = crypto.randomUUID();
-    this.registry = new HibernationRegistry(ctx, env);
     this.sessionStore = __experimental_newDurableObjectSessionStore(ctx.storage, "hib:");
     const existingSockets = this.ctx.getWebSockets("capnweb");
     console.log("[HibRpcDo] constructor", JSON.stringify({
@@ -292,6 +437,7 @@ export class HibRpcDo extends DurableObject {
           reusedSessionCount: this.reusedSessionCount,
           createdSessionCount: this.createdSessionCount,
           lastMessageKind: this.lastMessageKind,
+          clientCallbackCount: this.clientCallbacks.size,
         },
         sessions: diagnostics,
       });
@@ -398,7 +544,6 @@ export class HibRpcDo extends DurableObject {
         ws as any,
         new RootTarget(this.ctx, this.env as Env, this),
         {
-          hibernationRegistry: this.registry as any,
           sessionStore: this.sessionStore,
           onSendError(err) { return err; },
           sessionId: knownSessionId,
@@ -501,6 +646,17 @@ export default {
       const stub = env.CHAT_ROOM.getByName(roomName);
       const innerUrl = new URL(request.url);
       innerUrl.pathname = url.pathname === "/chat-room-instance" ? "/instance-id" : "/diagnostics";
+      return stub.fetch(new Request(innerUrl.toString(), request));
+    }
+
+    if (url.pathname === "/chat-room-ws") {
+      const roomName = url.searchParams.get("room");
+      if (!roomName) {
+        return new Response("Missing room query parameter", { status: 400 });
+      }
+      const stub = env.CHAT_ROOM.getByName(roomName);
+      const innerUrl = new URL(request.url);
+      innerUrl.pathname = "/ws";
       return stub.fetch(new Request(innerUrl.toString(), request));
     }
 
