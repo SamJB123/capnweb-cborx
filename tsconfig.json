@@ -4,6 +4,7 @@
     "module": "esnext",
     "lib": ["esnext", "dom"],
     "moduleResolution": "bundler",
+    "ignoreDeprecations": "6.0",
     "isolatedModules": true,
     "esModuleInterop": true,
     "strict": true,

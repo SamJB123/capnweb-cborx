@@ -6,7 +6,6 @@ import { Encoder, Decoder, Tag } from 'cbor-x'
 import type { PropertyPath } from './core.js'
 import type { MessageEncodingMode } from './message-types.js'
 import type { RpcSessionSnapshot } from './hibernation.js'
-import { WORKERS_MODULE_SYMBOL } from './symbols.js'
 import {
 	MessageTypeId,
 	MessageTypeById,
@@ -16,12 +15,6 @@ import {
 	type ExpressionTypeName,
 } from './message-types.js'
 
-let CAN_GENERATE_CODE = true
-try {
-	new Function('')
-} catch {
-	CAN_GENERATE_CODE = false
-}
 
 // CBOR tag for RPC messages. Using tag 39999 (unassigned private use range).
 // This allows us to distinguish RPC messages from arbitrary data.
@@ -155,11 +148,9 @@ export class CborCodec {
 		// encoder and decoder so that structure IDs resolve correctly.
 		const sharedStructures = sequential ? undefined : this.encoderStructures
 
-		const useRecords = CAN_GENERATE_CODE && !(globalThis as Record<PropertyKey, unknown>)[WORKERS_MODULE_SYMBOL]
-
 		this.encoder = new Encoder({
 			sequential,
-			useRecords,
+			useRecords: true,
 			encodeUndefinedAsNil: false,
 			tagUint8Array: true,
 			pack,
@@ -168,7 +159,7 @@ export class CborCodec {
 
 		this.decoder = new Decoder({
 			sequential,
-			useRecords,
+			useRecords: true,
 			structures: sharedStructures ?? this.decoderStructures,
 		})
 	}
@@ -203,7 +194,7 @@ export class CborCodec {
 
 		this.encoder = new Encoder({
 			sequential: this.options.sequential,
-			useRecords: CAN_GENERATE_CODE && !(globalThis as Record<PropertyKey, unknown>)[WORKERS_MODULE_SYMBOL],
+			useRecords: true,
 			encodeUndefinedAsNil: false,
 			tagUint8Array: true,
 			pack: this.options.pack,
@@ -212,7 +203,7 @@ export class CborCodec {
 
 		this.decoder = new Decoder({
 			sequential: this.options.sequential,
-			useRecords: CAN_GENERATE_CODE && !(globalThis as Record<PropertyKey, unknown>)[WORKERS_MODULE_SYMBOL],
+			useRecords: true,
 			structures: sharedStructures ?? this.decoderStructures,
 		})
 	}
@@ -223,6 +214,13 @@ export class CborCodec {
 			decodePaths: this.decodePathRegistry.slice(),
 			encodeStrings: stringsFromRegistry(this.encodeStringRegistry),
 			decodeStrings: this.decodeStringRegistry.slice(),
+			// With sequential: true, the encoder structures are always empty (definitions
+			// are embedded inline in each message). Only the decoder accumulates structures
+			// from the stream — these must be persisted so a restored server can still
+			// decode messages from a client whose encoder references them.
+			decoderStructures: this.decoderStructures.map(
+				s => Array.isArray(s) ? [...s] as string[] : []
+			),
 		}
 	}
 
@@ -244,6 +242,16 @@ export class CborCodec {
 			this.decodeStringRegistry.push(value)
 		}
 		this.nextStringId = Math.max(this.nextStringId, this.decodeStringRegistry.length)
+
+		// Restore cbor-x decoder structures. These must be populated in the same
+		// array instance that was passed to the Decoder constructor, since cbor-x
+		// holds a reference to it and mutates it in place.
+		if (snapshot.decoderStructures) {
+			this.decoderStructures.length = 0
+			for (const struct of snapshot.decoderStructures) {
+				this.decoderStructures.push([...struct])
+			}
+		}
 	}
 
 	/**

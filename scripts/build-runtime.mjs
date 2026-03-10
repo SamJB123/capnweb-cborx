@@ -4,7 +4,6 @@ await build({
   entry: ["src/index.ts", "src/index-workers.ts"],
   format: ["esm", "cjs"],
   external: ["cloudflare:workers"],
-  noExternal: ["cbor-x"],
   dts: false,
   sourcemap: true,
   clean: true,

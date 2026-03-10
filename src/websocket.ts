@@ -44,7 +44,9 @@ export function newWorkersWebSocketRpcResponse(
 }
 
 export type HibernatableWebSocketOptions = RpcSessionOptions & {
-  sessionStore: HibernatableSessionStore;
+  /** Optional session store for persisting snapshots to durable storage as a
+   *  backup. The primary persistence mechanism is the WebSocket attachment. */
+  sessionStore?: HibernatableSessionStore;
   hibernationRegistry: HibernatableRpcTargetRegistry;
   sessionId?: string;
 };
@@ -67,13 +69,18 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
     localMain: any,
     options: HibernatableWebSocketOptions): Promise<HibernatableWebSocketSession> {
 
-  let sessionId = options.sessionId ?? getAttachedSessionId(webSocket);
-  if (!sessionId) {
-    sessionId = makeSessionId();
-    webSocket.serializeAttachment?.({sessionId, version: 1 satisfies 1});
-  }
+  // Read existing attachment (if resuming from hibernation).
+  // The attachment is the primary source — it carries the full snapshot
+  // (export table + codec state) per-WebSocket, persisted automatically
+  // by workerd's hibernation machinery.
+  let attachment = getAttachment(webSocket);
+  const sessionId = options.sessionId ?? attachment?.sessionId ?? makeSessionId();
 
-  let snapshot = await options.sessionStore.load(sessionId);
+  // Restore snapshot: prefer attachment (always up-to-date for this connection),
+  // fall back to session store if provided (for backwards compatibility).
+  let snapshot = attachment?.snapshot
+      ?? (options.sessionStore ? await options.sessionStore.load(sessionId) : undefined);
+
   let rpc!: RpcSession;
   let persistScheduled = false;
   let transport = new HibernatableWebSocketTransport(webSocket, () => {
@@ -111,7 +118,18 @@ export async function __experimental_newHibernatableWebSocketRpcSession(
 
   async function persistSnapshot() {
     try {
-      await options.sessionStore.save(sessionId!, rpc.__experimental_snapshot());
+      let snap = rpc.__experimental_snapshot();
+      // Primary: persist the full snapshot in the WebSocket attachment.
+      // This survives hibernation automatically — no storage round-trip.
+      webSocket.serializeAttachment?.({
+        sessionId,
+        version: 1 satisfies 1,
+        snapshot: snap,
+      } satisfies HibernatableWebSocketAttachment);
+      // Secondary: also write to the session store if provided.
+      if (options.sessionStore) {
+        await options.sessionStore.save(sessionId!, snap);
+      }
     } catch (err) {
       transport.abort?.(err);
     }
@@ -125,10 +143,10 @@ export async function __experimental_resumeHibernatableWebSocketRpcSession(
   return __experimental_newHibernatableWebSocketRpcSession(webSocket, localMain, options);
 }
 
-function getAttachedSessionId(webSocket: HibernatableWebSocket): string | undefined {
+function getAttachment(webSocket: HibernatableWebSocket): HibernatableWebSocketAttachment | undefined {
   let attachment = webSocket.deserializeAttachment?.() as HibernatableWebSocketAttachment | null | undefined;
   if (attachment?.version === 1 && typeof attachment.sessionId === "string") {
-    return attachment.sessionId;
+    return attachment;
   }
 
   return undefined;

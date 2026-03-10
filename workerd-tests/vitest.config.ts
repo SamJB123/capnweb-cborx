@@ -12,7 +12,7 @@ export default defineConfig({
       workers: {
         miniflare: {
           compatibilityDate: "2025-07-01",
-          compatibilityFlags: ["expose_global_message_channel"],
+          compatibilityFlags: ["expose_global_message_channel", "nodejs_compat"],
           serviceBindings: {
             testServer: "test-server-workerd",
           },
@@ -20,6 +20,7 @@ export default defineConfig({
             {
               name: "test-server-workerd",
               compatibilityDate: "2025-07-01",
+              compatibilityFlags: ["nodejs_compat"],
               modules: [
                 {
                   type: "ESModule",

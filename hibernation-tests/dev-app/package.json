@@ -1,0 +1,17 @@
+{
+  "name": "capnweb-dev-app",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:client": "esbuild ./src/client.ts --bundle --format=esm --platform=browser --target=es2022 --outfile=./public/capnweb.js",
+    "dev": "npm run build:client && wrangler dev"
+  },
+  "dependencies": {
+    "capnweb": "file:../.."
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260310.1",
+    "esbuild": "^0.25.10",
+    "wrangler": "^4.71.0"
+  }
+}

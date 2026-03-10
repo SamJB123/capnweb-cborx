@@ -894,9 +894,9 @@ describe("Pass-by-Reference for Objects through PropertyPath caching", () => {
     await session1.set("bar", "hello");
 
     using session2 = await harness.stub.getSession();
-    expect(await session2.get("foo")).toBe(123);
-    expect(await session2.get("bar")).toBe("hello");
-    expect(await session2.keys()).toStrictEqual(["foo", "bar"]);
+    expect(await session2!.get("foo")).toBe(123);
+    expect(await session2!.get("bar")).toBe("hello");
+    expect(await session2!.keys()).toStrictEqual(["foo", "bar"]);
   });
 
   /**
@@ -1726,7 +1726,7 @@ describe("Remote Map Operations through PropertyPath caching", () => {
     await using harness = new TestHarness(new DataProvider());
 
     using numbers = harness.stub.getNumbers();
-    const squares = await numbers.map((n: number) => harness.stub.square(n));
+    const squares = await numbers.map(n => harness.stub.square(n));
 
     expect(squares).toStrictEqual([1, 4, 9, 16, 25]);
   });
@@ -1745,7 +1745,7 @@ describe("Remote Map Operations through PropertyPath caching", () => {
     await using harness = new TestHarness(new DataProvider());
 
     using ids = harness.stub.getIds();
-    const details = await ids.map((id: number) => harness.stub.getDetails(id));
+    const details = await ids.map(id => harness.stub.getDetails(id));
 
     expect(details).toStrictEqual([
       { id: 1, name: "item-1", value: 100 },
@@ -1767,8 +1767,8 @@ describe("Remote Map Operations through PropertyPath caching", () => {
     await using harness = new TestHarness(new DataProvider());
 
     using outer = harness.stub.getOuter();
-    const result = await outer.map((x: number) => {
-      return harness.stub.getInner(x).map((y: number) => {
+    const result = await outer.map(x => {
+      return harness.stub.getInner(x).map(y => {
         return harness.stub.double(y);
       });
     });
@@ -1826,7 +1826,7 @@ describe("Remote Map Operations through PropertyPath caching", () => {
     await using harness = new TestHarness(new DataProvider());
 
     using single = harness.stub.getSingleValue();
-    const result = await single.map((x: number) => harness.stub.double(x));
+    const result = await single.map(x => harness.stub.double(x));
 
     expect(result).toBe(84);
   });
@@ -1849,7 +1849,7 @@ describe("Remote Map Operations through PropertyPath caching", () => {
     await using harness = new TestHarness(new DataProvider());
 
     using values = harness.stub.getValues();
-    using counters = await values.map((v: number) => harness.stub.makeCounter(v));
+    using counters = await values.map(v => harness.stub.makeCounter(v));
 
     expect(counters.length).toBe(3);
     expect(await counters[0].getValue()).toBe(10);
@@ -1869,7 +1869,7 @@ describe("Remote Map Operations through PropertyPath caching", () => {
     await using harness = new TestHarness(new DataProvider());
 
     using range = harness.stub.getRange(100);
-    const squares = await range.map((x: number) => harness.stub.square(x));
+    const squares = await range.map(x => harness.stub.square(x));
 
     expect(squares.length).toBe(100);
     expect(squares[0]).toBe(0);
@@ -1891,7 +1891,7 @@ describe("Remote Map Operations through PropertyPath caching", () => {
     await using harness = new TestHarness(new DataProvider());
 
     using ids = harness.stub.getIds();
-    const profiles = await ids.map((id: number) => {
+    const profiles = await ids.map(id => {
       return {
         id,
         name: harness.stub.getName(id),
@@ -1923,10 +1923,10 @@ describe("Remote Map Operations through PropertyPath caching", () => {
 
     // Chain maps: for each number, double it, then map over that result to add ten
     // This demonstrates nested .map() calls within the callback
-    const result = await numbers.map((x: number) => {
+    const result = await numbers.map(x => {
       // harness.stub.double(x) returns an RpcPromise
       // We can call .map() on that promise to chain another operation
-      return harness.stub.double(x).map((doubled: number) => {
+      return harness.stub.double(x).map(doubled => {
         return harness.stub.addTen(doubled);
       });
     });

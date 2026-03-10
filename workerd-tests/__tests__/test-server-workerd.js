@@ -89,13 +89,35 @@ class DurableCounterProxy extends JsRpcTarget {
 }
 
 class HibernationRootTarget extends JsRpcTarget {
-  constructor(env) {
+  constructor(env, host) {
     super();
     this.env = env;
+    this.host = host;
   }
 
   getDurableCounter(name) {
     return new DurableCounterProxy(this.env, `hib-counter:${name}`);
+  }
+
+  square(i) {
+    return i * i;
+  }
+
+  async delayedDurableIncrement(name, amount = 1, delayMs = 10) {
+    await new Promise(resolve => setTimeout(resolve, delayMs));
+    return this.getDurableCounter(name).increment(amount);
+  }
+
+  registerClientListener(name, listener) {
+    this.host.registerClientListener(name, listener);
+  }
+
+  pushToClient(name, message) {
+    return this.host.pushToClient(name, message);
+  }
+
+  getRegisteredClientCount() {
+    return this.host.clientListeners.size;
   }
 }
 
@@ -130,6 +152,7 @@ export class HibernationRpcDo extends DurableObject {
     this.registry = new HibernationRegistry(env);
     this.sessionStore = __experimental_newDurableObjectSessionStore(ctx.storage, "hib:");
     this.sessions = new Map();
+    this.clientListeners = new Map();
     this.ready = this.restoreSessions();
   }
 
@@ -139,6 +162,17 @@ export class HibernationRpcDo extends DurableObject {
     if (url.pathname === "/control/restore" && req.method === "POST") {
       await this.forceHibernateAndRestore();
       return new Response("ok");
+    }
+
+    if (url.pathname.startsWith("/control/push/") && req.method === "POST") {
+      const [, , , name, ...rest] = url.pathname.split("/");
+      const message = decodeURIComponent(rest.join("/"));
+      await this.pushToClient(name, message);
+      return new Response("ok");
+    }
+
+    if (url.pathname === "/control/listener-count" && req.method === "GET") {
+      return Response.json({ count: this.clientListeners.size });
     }
 
     if (req.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
@@ -178,6 +212,7 @@ export class HibernationRpcDo extends DurableObject {
 
   async forceHibernateAndRestore() {
     this.sessions.clear();
+    this.clientListeners.clear();
     await this.restoreSessions();
   }
 
@@ -199,7 +234,7 @@ export class HibernationRpcDo extends DurableObject {
   async attachSession(ws) {
     const session = await __experimental_newHibernatableWebSocketRpcSession(
       ws,
-      new HibernationRootTarget(this.env),
+      new HibernationRootTarget(this.env, this),
       {
         sessionStore: this.sessionStore,
         hibernationRegistry: this.registry,
@@ -212,6 +247,17 @@ export class HibernationRpcDo extends DurableObject {
   getSessionId(ws) {
     return ws.deserializeAttachment()?.sessionId;
   }
+
+  registerClientListener(name, listener) {
+    this.clientListeners.set(name, listener);
+  }
+
+  async pushToClient(name, message) {
+    const listener = this.clientListeners.get(name);
+    if (!listener) return false;
+    await listener.notify(message);
+    return true;
+  }
 }
 
 export default {
@@ -223,6 +269,13 @@ export default {
     if (url.pathname === "/hibernate-force" && req.method === "POST") {
       await env.HIB_RPC.getByName("default").forceHibernateAndRestore();
       return new Response("ok");
+    }
+    if (url.pathname.startsWith("/hibernate-push/") && req.method === "POST") {
+      const controlPath = url.pathname.replace("/hibernate-push/", "/control/push/");
+      return env.HIB_RPC.getByName("default").fetch(`http://foo${controlPath}`, { method: "POST" });
+    }
+    if (url.pathname === "/hibernate-listener-count" && req.method === "GET") {
+      return env.HIB_RPC.getByName("default").fetch("http://foo/control/listener-count");
     }
 
     return newWorkersRpcResponse(req, new TestTarget(env), {

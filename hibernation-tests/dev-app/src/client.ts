@@ -1,0 +1,1 @@
+export { newWebSocketRpcSession } from "capnweb";

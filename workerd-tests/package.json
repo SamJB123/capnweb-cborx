@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "vitest run"
+    "build": "node -e \"const fs=require('fs'); fs.mkdirSync('dist',{recursive:true}); fs.copyFileSync('../dist/index-workers.js','dist/index-workers.js');\"",
+    "test": "npm run build && vitest run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "0.12.20",

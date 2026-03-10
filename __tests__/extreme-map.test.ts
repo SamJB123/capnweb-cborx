@@ -157,7 +157,7 @@ describe("Extreme Map: Privacy-Preserving Medical Analysis", () => {
 
     // Client maps over patients to get anonymized diagnosis stats
     // The RAW diagnosis data (with patient names, dates, etc.) NEVER leaves the server
-    const anonymizedStats = await patients.map((patient: PatientRecord) => {
+    const anonymizedStats = await patients.map(patient => {
       const diagnosis = harness.stub.getDiagnosis(patient.id);
       return harness.stub.anonymize(diagnosis);
     });
@@ -263,7 +263,7 @@ describe("Extreme Map: Billion-Row Aggregation", () => {
     using transactions = harness.stub.getTransactions();
 
     // Client maps to categorize and aggregate - all server-side
-    const categoryData = await transactions.map((tx: Transaction) => {
+    const categoryData = await transactions.map(tx => {
       const category = harness.stub.categorize(tx.merchantId);
       return harness.stub.aggregate(category.category, tx.amount);
     });
@@ -395,9 +395,9 @@ describe("Extreme Map: Social Graph Traversal", () => {
 
     // For each friend, get THEIR friends, then get posts
     // Client has NO IDEA how many friends-of-friends exist
-    const friendOfFriendPosts = await friends.map((friend: UserProfile) => {
-      return harness.stub.getFriends(friend.userId).map((fof: UserProfile) => {
-        return harness.stub.getRecentPosts(fof.userId).map((post: Post) => {
+    const friendOfFriendPosts = await friends.map(friend => {
+      return harness.stub.getFriends(friend.userId).map(fof => {
+        return harness.stub.getRecentPosts(fof.userId).map(post => {
           return harness.stub.formatPostSummary(fof, post);
         });
       });
@@ -598,7 +598,7 @@ describe("Extreme Map: Cross-Service Orchestration", () => {
 
     // For each order, call THREE different services and combine results
     // IMPORTANT: Get service stubs INSIDE the callback, or use main stub directly
-    const enrichedOrders = await orders.map((order: Order) => {
+    const enrichedOrders = await orders.map(order => {
       // Get sub-service stubs inside callback so they're part of the recording
       const customerService = harness.stub.getCustomerService();
       const inventoryService = harness.stub.getInventoryService();
@@ -738,17 +738,17 @@ describe("Extreme Map: Recursive Tree Processing", () => {
     // Key insight: Always collect metadata AND recurse into children at every level.
     // For files, getChildren() returns [] which naturally produces nothing when mapped.
     // This avoids conditionals (which can't work in map recording since RpcPromises are truthy).
-    const level1 = await root.map((node: FileSystemNode) => {
+    const level1 = await root.map(node => {
       // Level 1: For each root item (/home, /etc), get its children
-      return harness.stub.getChildren(node.path).map((child: FileSystemNode) => {
+      return harness.stub.getChildren(node.path).map(child => {
         // Level 2: Get metadata for this node AND recurse
         return {
           metadata: harness.stub.getMetadata(child),
-          children: harness.stub.getChildren(child.path).map((grandchild: FileSystemNode) => {
+          children: harness.stub.getChildren(child.path).map(grandchild => {
             // Level 3: Get metadata for this node AND recurse
             return {
               metadata: harness.stub.getMetadata(grandchild),
-              children: harness.stub.getChildren(grandchild.path).map((greatGrandchild: FileSystemNode) => {
+              children: harness.stub.getChildren(grandchild.path).map(greatGrandchild => {
                 // Level 4: Finally get metadata for great-grandchildren
                 return harness.stub.getMetadata(greatGrandchild);
               })
@@ -908,7 +908,7 @@ describe("Extreme Map: Capability-Gated Bulk Operations", () => {
     using users = harness.stub.getAllUsers();
 
     // For each user, check permission AND conditionally fetch data
-    const accessResults = await users.map((user: User) => {
+    const accessResults = await users.map(user => {
       const permission = authService.checkPermission(user.userId, "sensitive_data");
       // Note: Data is fetched regardless, but buildAccessResult hides it if not permitted
       const data = dataService.getSensitiveData(user.userId);
@@ -1090,8 +1090,8 @@ describe("Extreme Map: Distributed AI Inference Pipeline", () => {
     // For each frame -> detect objects -> classify each -> assess risk
     // IMPORTANT: In nested .map() callbacks, always use harness.stub.* directly
     // Don't use stubs from outer scope in inner callbacks
-    const pipelineResults = await frames.map((frame: VideoFrame) => {
-      return harness.stub.getAIService().detectObjects(frame).map((obj: DetectedObject) => {
+    const pipelineResults = await frames.map(frame => {
+      return harness.stub.getAIService().detectObjects(frame).map(obj => {
         // Use harness.stub.* in inner callback, not stubs from outer scope
         const classification = harness.stub.getAIService().classify(obj);
         const riskAssessment = harness.stub.getRiskService().assessThreat(classification);
@@ -1273,15 +1273,13 @@ describe("Extreme Map: Real-Time Game State Computation", () => {
 
     // For each unit, find enemies in range, calculate damage, apply modifiers, build result
     // IMPORTANT: In nested/chained .map() callbacks, always use harness.stub.* directly
-    const combatResults = await player1Units.map((unit: GameUnit) => {
+    const combatResults = await player1Units.map(unit => {
       // Chain of maps: enemies -> damage calculations -> modified damages
       // Use harness.stub.* throughout to avoid scope issues
       const modifiedDamages = harness.stub.getGameState().getEnemiesInRange(unit.position, unit.attackRange, unit.playerId)
-        .map((enemy: GameUnit) => {
-          return harness.stub.getCombat().calculateDamage(unit, enemy);
-        })
-        .map((damage: DamageCalculation) => {
-          // Second map: apply terrain/critical modifiers to each damage result
+        .map(enemy => {
+          // Calculate damage then apply terrain/critical modifiers in one step
+          const damage = harness.stub.getCombat().calculateDamage(unit, enemy);
           return harness.stub.getCombat().applyBattleModifiers(damage, unit.unitType);
         });
       // Pass the RpcPromise of modified damages to buildCombatResult (pipelining resolves it)
@@ -1432,7 +1430,7 @@ describe("Extreme Map: Lazy Database Cursor with Joins", () => {
     using cursor = harness.stub.queryCursor("SELECT * FROM orders WHERE status = 'pending'");
 
     // For each row, join with product and supplier tables
-    const enrichedOrders = await cursor.map((row: OrderRow) => {
+    const enrichedOrders = await cursor.map(row => {
       const product = harness.stub.getProduct(row.productId);
       const supplier = harness.stub.getSupplier(product.supplierId);
       return harness.stub.enrichOrder(row, product, supplier);
@@ -1498,6 +1496,11 @@ describe("Extreme Map: Webhook-as-a-Service (The Terrifying One)", () => {
     acknowledged: boolean;
   }
 
+  // Interface for generic event handlers that can be registered with the service
+  interface EventHandler extends RpcTarget {
+    onEvent(event: Event): { received: boolean; callNumber: number };
+  }
+
   // Client-side webhook handler (this is what gets "captured" and sent to server)
   class ClientWebhookHandler extends RpcTarget {
     private receivedEvents: Event[] = [];
@@ -1545,12 +1548,12 @@ describe("Extreme Map: Webhook-as-a-Service (The Terrifying One)", () => {
       return this.registeredWebhook;
     }
 
-    // Generic handler registration - allows any RpcTarget to be registered and returned
+    // Handler registration - accepts any RpcTarget and returns it for callback use
     // This gives the server a stub to call back to the client
     // IMPORTANT: Must dup() to keep the stub alive after the call completes
-    registerHandler<T extends RpcTarget>(handler: RpcStub<T>): RpcStub<T> {
+    registerHandler(handler: RpcStub<EventHandler>): EventHandler {
       this.registeredGenericHandler = handler.dup();
-      return this.registeredGenericHandler;
+      return this.registeredGenericHandler as unknown as EventHandler;
     }
 
     // Cleanup registered handlers
@@ -1602,7 +1605,7 @@ describe("Extreme Map: Webhook-as-a-Service (The Terrifying One)", () => {
 
     // For each event, call the CLIENT's webhook handler via its stub
     // THIS IS THE TERRIFYING PART: The server will call YOUR stub for each event
-    const processed = await events.map((event: Event) => {
+    const processed = await events.map(event => {
       // webhookStub.notify calls BACK to the client's handler
       // The server invokes this for each event during map replay
       const delivery = webhookStub.notify(event);
@@ -1659,7 +1662,7 @@ describe("Extreme Map: Webhook-as-a-Service (The Terrifying One)", () => {
 
     // The server will invoke webhookStub.onEvent for EVERY event
     // A malicious server could invoke it thousands of times
-    const results = await events.map((event: Event) => {
+    const results = await events.map(event => {
       return webhookStub.onEvent(event);
     });
 

@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>capnweb-cborx dev test</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+    button { padding: 0.5rem 1rem; margin: 0.25rem; cursor: pointer; }
+    #log { background: #111; color: #0f0; padding: 1rem; font-family: monospace; font-size: 13px;
+           white-space: pre-wrap; max-height: 500px; overflow-y: auto; border-radius: 4px; }
+    .error { color: #f44; }
+    .ok { color: #4f4; }
+    .info { color: #48f; }
+    h2 { margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <h1>capnweb-cborx test app</h1>
+
+  <div>
+    <button onclick="connect()">Connect WebSocket</button>
+    <button onclick="disconnect()">Disconnect</button>
+    <button onclick="clearLog()">Clear Log</button>
+  </div>
+
+  <h2>Basic RPC</h2>
+  <div>
+    <button onclick="callSquare(7)">square(7)</button>
+    <button onclick="callSquare(42)">square(42)</button>
+    <button onclick="callEcho('hello')">echo("hello")</button>
+    <button onclick="callInstanceId()">getInstanceId()</button>
+  </div>
+
+  <h2>Stress test (codec structures)</h2>
+  <div>
+    <button onclick="stressSquare(10)">10x square</button>
+    <button onclick="stressSquare(50)">50x square</button>
+  </div>
+
+  <h2>Counter (child stub)</h2>
+  <div>
+    <button onclick="getCounter()">getCounter("test")</button>
+    <button onclick="counterIncrement(1)">increment(1)</button>
+    <button onclick="counterIncrement(10)">increment(10)</button>
+    <button onclick="counterGetValue()">getValue()</button>
+  </div>
+
+  <h2>Hibernation</h2>
+  <div>
+    <button onclick="checkHibernation()">Check instance ID (wakes DO)</button>
+    <p style="font-size:13px;color:#888">Wait ~15s after last call for DO to hibernate, then click check or try RPC calls.</p>
+  </div>
+
+  <div id="log"></div>
+
+  <script type="module">
+    // We load capnweb client from the npm package via a CDN or inline bundle.
+    // Since this is a static HTML page served by wrangler, we'll inline the client.
+    // Actually, capnweb's client (newWebSocketRpcSession) runs in the browser.
+    // We need to serve it. Let's use the dist build.
+
+    // For simplicity, we'll use a dynamic import from the worker's bundled output.
+    // But that won't work from static HTML. Instead, let's create a simple
+    // WebSocket client inline that just calls the capnweb API.
+
+    // We'll load capnweb from a script tag. Let's serve it from the worker.
+    // Actually the simplest approach: just include the client logic inline.
+
+    let ws = null;
+    let root = null;
+    let counter = null;
+    let lastInstanceId = null;
+
+    const logEl = document.getElementById('log');
+
+    function log(msg, cls = '') {
+      const line = document.createElement('span');
+      line.className = cls;
+      line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}\n`;
+      logEl.appendChild(line);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    window.clearLog = () => { logEl.innerHTML = ''; };
+
+    // We need the capnweb client library. Let's load it as an ES module.
+    // The dist/index.js is the browser/neutral build.
+    let capnweb = null;
+
+    async function loadCapnweb() {
+      if (capnweb) return;
+      try {
+        // Try loading from the capnweb dist (served as static asset)
+        capnweb = await import('./capnweb.js');
+        log('capnweb loaded', 'ok');
+      } catch (e) {
+        log('Failed to load capnweb: ' + e.message, 'error');
+      }
+    }
+
+    window.connect = async function() {
+      await loadCapnweb();
+      if (!capnweb) return;
+
+      if (ws) { ws.close(); ws = null; root = null; counter = null; }
+
+      try {
+        const url = `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
+        log(`Connecting to ${url}...`, 'info');
+        const rawWs = new WebSocket(url);
+        rawWs.binaryType = 'arraybuffer';
+
+        await new Promise((resolve, reject) => {
+          rawWs.onopen = resolve;
+          rawWs.onerror = reject;
+        });
+
+        ws = rawWs;
+        root = capnweb.newWebSocketRpcSession(ws);
+        log('Connected!', 'ok');
+      } catch (e) {
+        log('Connect failed: ' + e.message, 'error');
+      }
+    };
+
+    window.disconnect = function() {
+      if (ws) { ws.close(); ws = null; root = null; counter = null; }
+      log('Disconnected', 'info');
+    };
+
+    window.callSquare = async function(n) {
+      if (!root) { log('Not connected', 'error'); return; }
+      try {
+        const result = await root.square(n);
+        log(`square(${n}) = ${result}`, 'ok');
+      } catch (e) {
+        log(`square(${n}) FAILED: ${e.message}`, 'error');
+      }
+    };
+
+    window.callEcho = async function(msg) {
+      if (!root) { log('Not connected', 'error'); return; }
+      try {
+        const result = await root.echo(msg);
+        log(`echo("${msg}") = "${result}"`, 'ok');
+      } catch (e) {
+        log(`echo FAILED: ${e.message}`, 'error');
+      }
+    };
+
+    window.callInstanceId = async function() {
+      if (!root) { log('Not connected', 'error'); return; }
+      try {
+        const id = await root.getInstanceId();
+        if (lastInstanceId && id !== lastInstanceId) {
+          log(`instanceId = ${id} (CHANGED from ${lastInstanceId} - hibernation happened!)`, 'info');
+        } else {
+          log(`instanceId = ${id}`, 'ok');
+        }
+        lastInstanceId = id;
+      } catch (e) {
+        log(`getInstanceId FAILED: ${e.message}`, 'error');
+      }
+    };
+
+    window.stressSquare = async function(n) {
+      if (!root) { log('Not connected', 'error'); return; }
+      log(`Running ${n}x square calls...`, 'info');
+      for (let i = 0; i < n; i++) {
+        try {
+          const result = await root.square(i);
+          if (result !== i * i) {
+            log(`square(${i}) = ${result} (WRONG, expected ${i*i})`, 'error');
+            return;
+          }
+        } catch (e) {
+          log(`square(${i}) FAILED: ${e.message}`, 'error');
+          return;
+        }
+      }
+      log(`All ${n} square calls passed!`, 'ok');
+    };
+
+    window.getCounter = async function() {
+      if (!root) { log('Not connected', 'error'); return; }
+      try {
+        counter = await root.getCounter("test");
+        log('Got counter stub', 'ok');
+      } catch (e) {
+        log(`getCounter FAILED: ${e.message}`, 'error');
+      }
+    };
+
+    window.counterIncrement = async function(n) {
+      if (!counter) { log('No counter - click getCounter first', 'error'); return; }
+      try {
+        const result = await counter.increment(n);
+        log(`counter.increment(${n}) = ${result}`, 'ok');
+      } catch (e) {
+        log(`increment FAILED: ${e.message}`, 'error');
+      }
+    };
+
+    window.counterGetValue = async function() {
+      if (!counter) { log('No counter - click getCounter first', 'error'); return; }
+      try {
+        const result = await counter.getValue();
+        log(`counter.getValue() = ${result}`, 'ok');
+      } catch (e) {
+        log(`getValue FAILED: ${e.message}`, 'error');
+      }
+    };
+
+    window.checkHibernation = async function() {
+      try {
+        const resp = await fetch('/instance-id');
+        const json = await resp.json();
+        if (lastInstanceId && json.instanceId !== lastInstanceId) {
+          log(`Instance ID changed: ${lastInstanceId} -> ${json.instanceId} (HIBERNATION CONFIRMED)`, 'info');
+        } else {
+          log(`Instance ID: ${json.instanceId} (same - no hibernation yet)`, 'ok');
+        }
+        lastInstanceId = json.instanceId;
+      } catch (e) {
+        log(`Check failed: ${e.message}`, 'error');
+      }
+    };
+  </script>
+</body>
+</html>

@@ -8,17 +8,13 @@
       {
         "name": "HIB_RPC",
         "class_name": "HibRpcDo"
-      },
-      {
-        "name": "CHAT_ROOM",
-        "class_name": "ChatRoomDo"
       }
     ]
   },
   "migrations": [
     {
-      "tag": "v2",
-      "new_sqlite_classes": ["HibRpcDo", "ChatRoomDo"]
+      "tag": "v1",
+      "new_sqlite_classes": ["HibRpcDo"]
     }
   ]
 }

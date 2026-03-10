@@ -1,26 +1,19 @@
 {
   "name": "capnweb-hibernation-tests",
   "private": true,
-  "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite dev",
-    "build": "vite build",
-    "preview": "npm run build && vite preview",
-    "deploy": "npm run build && wrangler deploy",
-    "test": "vitest run"
+    "test": "vitest run",
+    "dev": "wrangler dev"
   },
   "dependencies": {
-    "capnweb": "file:..",
-    "partysocket": "^1.1.16"
+    "capnweb": "file:.."
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.15.3",
-    "@cloudflare/workers-types": "^4.20260205.0",
+    "@cloudflare/workers-types": "^4.20260101.0",
     "typescript": "^5.9.3",
-    "vite": "^7.1.5",
     "vitest": "^3.2.4",
     "wrangler": "^4.19.1",
-    "ws": "^8.19.0"
+    "ws": "^8.18.3"
   }
 }

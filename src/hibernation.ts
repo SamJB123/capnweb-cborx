@@ -31,18 +31,58 @@ export type RpcSessionSnapshotExport = {
   id: number;
   refcount: number;
   descriptor: HibernatableCapabilityDescriptor;
+  /** If true, this export had an in-flight pull at snapshot time.
+   *  On restore the pull will be re-triggered automatically so the
+   *  client receives the resolve/reject it is still waiting for. */
+  pulling?: boolean;
+};
+
+/**
+ * Snapshot of a peer-imported capability (i.e. the peer exported an RpcTarget to us).
+ *
+ * Unlike exports, imports don't need a registry — the real object lives on the peer.
+ * We just need to remember the import ID and refcount so we can continue sending
+ * RPC messages referencing the correct ID after hibernation. The peer's export table
+ * still maps this ID to the real object because the WebSocket was never disconnected.
+ */
+export type RpcSessionSnapshotImport = {
+  id: number;
+  remoteRefcount: number;
 };
 
 export type RpcSessionSnapshot = {
   version: 1;
   nextExportId: number;
   exports: RpcSessionSnapshotExport[];
+  /** Peer-imported capabilities (stubs pointing back to the peer's exports).
+   *  Only unresolved imports are snapshotted — resolved imports have already
+   *  sent a release to the peer and are handled locally. */
+  imports?: RpcSessionSnapshotImport[];
   codec: {
     encodePaths: PropertyPath[];
     decodePaths: PropertyPath[];
     encodeStrings: string[];
     decodeStrings: string[];
+    /** cbor-x sequential-mode structure definitions accumulated by the decoder.
+     *  Each entry is an array of property names representing an object shape. */
+    decoderStructures?: string[][];
   };
+};
+
+/**
+ * Everything needed to resume an RPC session after hibernation, stored in the
+ * WebSocket attachment via workerd's serializeAttachment API.
+ *
+ * This includes both the per-connection codec state (CBOR decoder structures,
+ * path caches, string interning) and the export table (capability descriptors,
+ * refcounts). Both are per-WebSocket-connection and fit comfortably within
+ * the 16KB attachment limit for typical sessions.
+ */
+export type HibernatableWebSocketAttachment = {
+  sessionId: string;
+  version: 1;
+  /** Full RPC session snapshot, persisted per-connection. */
+  snapshot?: RpcSessionSnapshot;
 };
 
 export interface HibernatableSessionStore {
@@ -50,11 +90,6 @@ export interface HibernatableSessionStore {
   save(sessionId: string, snapshot: RpcSessionSnapshot): Promise<void>;
   delete?(sessionId: string): Promise<void>;
 }
-
-export type HibernatableWebSocketAttachment = {
-  sessionId: string;
-  version: 1;
-};
 
 export interface DurableObjectStorageLike {
   get(key: string): Promise<unknown>;
