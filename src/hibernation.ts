@@ -24,7 +24,7 @@ export type RpcSessionSnapshotExport = {
 /**
  * Snapshot of a peer-imported capability (i.e. the peer exported an RpcTarget to us).
  *
- * Unlike exports, imports don't need a registry — the real object lives on the peer.
+ * Unlike exports, imports don't need provenance — the real object lives on the peer.
  * We just need to remember the import ID and refcount so we can continue sending
  * RPC messages referencing the correct ID after hibernation. The peer's export table
  * still maps this ID to the real object because the WebSocket was never disconnected.

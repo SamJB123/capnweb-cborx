@@ -542,7 +542,7 @@ async function connectRoot() {
   });
 
   state.ws = ws;
-  state.root = newWebSocketRpcSession<any>(ws as any);
+  state.root = newWebSocketRpcSession(ws as WebSocket);
   state.lastAction = "Connected root";
   state.lastResult = "connected";
   state.lastError = null;
@@ -570,7 +570,7 @@ async function connectDirectRoom() {
   });
 
   state.directRoomWs = ws;
-  state.directRoomRoot = newWebSocketRpcSession<any>(ws as any);
+  state.directRoomRoot = newWebSocketRpcSession(ws as WebSocket);
   state.lastAction = "Connected direct room";
   state.lastResult = "connected";
   state.lastError = null;
@@ -1030,10 +1030,30 @@ function instrumentSocket(ws: PartySocket, channel: "hub" | "direct" = "hub") {
     return originalSend(data as any);
   }) as typeof ws.send;
 
+  let hasConnectedOnce = false;
   ws.addEventListener("open", () => {
     setSocketSnapshot({ state: "OPEN", event: "open" });
+    if (hasConnectedOnce) {
+      // PartySocket reconnected after a drop — re-establish the RPC session.
+      log(channel === "hub" ? "Socket reconnected — rebuilding RPC session"
+          : "Direct room socket reconnected — rebuilding RPC session");
+      if (channel === "hub") {
+        state.root = newWebSocketRpcSession(ws as WebSocket);
+        state.heldCounter = null;
+        state.heldRoom = null;
+        state.hiddenProbe = null;
+        state.clientCallback = null;
+        log("Rebuilt hub RPC session", __experimental_debugRpcReference(state.root));
+      } else {
+        state.directRoomRoot = newWebSocketRpcSession(ws as WebSocket);
+        state.directHeldRoom = null;
+        log("Rebuilt direct room RPC session", __experimental_debugRpcReference(state.directRoomRoot));
+      }
+    } else {
+      hasConnectedOnce = true;
+      log(channel === "hub" ? "Socket open" : "Direct room socket open");
+    }
     renderClientState();
-    log(channel === "hub" ? "Socket open" : "Direct room socket open");
   });
   ws.addEventListener("close", (event) => {
     setSocketSnapshot({ state: "CLOSED", event: `close ${event.code}` });
