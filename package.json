@@ -1,5 +1,5 @@
 {
-  "name": "capnweb",
+  "name": "capnweb-experimental-hibernation",
   "version": "0.6.1",
   "description": "JavaScript/TypeScript-native RPC library with Promise Pipelining",
   "main": "dist/index.js",
